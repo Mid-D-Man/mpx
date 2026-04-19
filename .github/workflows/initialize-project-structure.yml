@@ -1,24 +1,26 @@
-name: Initialize Project Structure
+name: Generate project structure
 
 on:
   workflow_dispatch:
     inputs:
-      template_path:
-        description: 'Path to the .mdix template in the source repo'
-        required: true
-        default: '.mdix/project_structure/project_structure.mdix'
-      branch:
-        description: 'Branch of the scaffold repo to use'
-        required: true
-        default: 'main'
+      override_stubs:
+        description: 'Overwrite existing stub files (true/false)'
+        required: false
+        default: 'false'
+      dry_run:
+        description: 'Preview without writing (true/false)'
+        required: false
+        default: 'false'
+  push:
+    paths:
+      - '.mdix/**'
 
 jobs:
-  initialize:
-    # This calls the reusable workflow from your central scaffold repo
+  generate:
     uses: Mid-D-Man/mdix-scaffold/.github/workflows/generate-structure.yml@main
     permissions:
       contents: write
     with:
-      template: ${{ github.event.inputs.template_path }}
-      # Uses the main branch of the calling repo to write the files
-      ref: ${{ github.ref_name }}
+      template:       '.mdix/project_structure/project_structure.mdix'
+      override_stubs: ${{ inputs.override_stubs || 'false' }}
+      dry_run:        ${{ inputs.dry_run || 'false' }}
