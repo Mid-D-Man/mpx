@@ -1,0 +1,44 @@
+@CONFIG(
+  version    -> "1.0.0"
+  generated  -> "2026-04-19T09:25:58Z"
+  features   -> "data"
+  debug_mode -> "off"
+)
+
+@DATA(
+  template      = ".mdix/project_structure/project_structure.mdix"
+  template_hash = "04297d62a269"
+  last_run      = "2026-04-19T09:25:58Z"
+  new_this_run  = 24
+  overridden    = 0
+  skipped       = 0
+  deleted       = 0
+  renamed       = 0
+  updated       = 0
+
+  created_files::
+    ".gitignore"
+    ".vscode/extensions.json"
+    ".vscode/settings.json"
+    "Cargo.toml"
+    "LICENSE"
+    "README.md"
+    "benches/compare.rs"
+    "corpus/gradients/.gitkeep"
+    "corpus/photos/.gitkeep"
+    "corpus/pixel_art/.gitkeep"
+    "corpus/synthetic/.gitkeep"
+    "docs/benchmarks.md"
+    "docs/format-spec.md"
+    "scripts/bench_corpus.sh"
+    "scripts/gen_corpus.sh"
+    "scripts/verify_corpus.sh"
+    "src/decode.rs"
+    "src/encode.rs"
+    "src/filter.rs"
+    "src/header.rs"
+    "src/lib.rs"
+    "src/main.rs"
+    "tests/.gitkeep"
+    "tests/roundtrip.rs"
+)

@@ -1,0 +1,26 @@
+[package]
+name = "mpx"
+version = "0.1.0"
+edition = "2021"
+authors = ["[[author]]"]
+description = "[[description]]"
+license = "MIT"
+
+[[bin]]
+name = "mpx"
+path = "src/main.rs"
+
+[lib]
+name = "mpx"
+path = "src/lib.rs"
+
+[dependencies]
+mbfa = { path = "../mbfa" }
+
+[dev-dependencies]
+image     = "0.25"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name    = "compare"
+harness = false

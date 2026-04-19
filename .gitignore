@@ -1,0 +1,7 @@
+target/
+*.lock
+.env
+.DS_Store
+**/.DS_Store
+corpus/**/*.raw
+corpus/**/*.png
