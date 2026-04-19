@@ -1,0 +1,235 @@
+name: MPX — Test, Bench, Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages:    write
+  id-token: write
+
+concurrency:
+  group:   pages
+  cancel-in-progress: true
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────
+  build-and-report:
+  # ─────────────────────────────────────────────────────────────────
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url:  ${{ steps.deployment.outputs.page_url }}
+
+    steps:
+      - name: Checkout MPX
+        uses: actions/checkout@v4
+
+      - name: Checkout MBFA (sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: Mid-D-Man/mbfa
+          path: ../mbfa
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ../mbfa/target
+          key: mpx-pages-${{ hashFiles('Cargo.toml', '../mbfa/Cargo.toml') }}
+          restore-keys: mpx-pages-
+
+      # ── Lint ───────────────────────────────────────────────────────
+      - name: Clippy
+        run: cargo clippy -- -D warnings 2>&1 | tee results/clippy.txt || true
+
+      # ── Tests ──────────────────────────────────────────────────────
+      - name: Create results dir
+        run: mkdir -p results
+
+      - name: Run tests (debug)
+        run: |
+          cargo test 2>&1 | tee results/test_debug.txt
+          echo "EXIT_DEBUG=$?" >> "$GITHUB_ENV"
+
+      - name: Run tests (release)
+        run: |
+          cargo test --release 2>&1 | tee results/test_release.txt
+          echo "EXIT_RELEASE=$?" >> "$GITHUB_ENV"
+
+      # ── Benchmarks ─────────────────────────────────────────────────
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Run criterion benchmarks
+        run: |
+          cargo bench --bench compare -- \
+            --output-format bencher \
+            2>&1 | tee results/bench_raw.txt || true
+
+      # ── Corpus ─────────────────────────────────────────────────────
+      - name: Generate synthetic corpus (Rust)
+        run: |
+          mkdir -p corpus/synthetic
+          # Solid colour 512×512 RGB
+          python3 - <<'PYEOF'
+          import struct, os
+
+          def write_raw(path, meta_path, pixels, w, h, mode, bpp):
+              os.makedirs(os.path.dirname(path), exist_ok=True)
+              with open(path, 'wb') as f:
+                  f.write(bytes(pixels))
+              with open(meta_path, 'w') as f:
+                  f.write(f"{w} {h} {mode} {bpp}\n")
+
+          W, H = 512, 512
+
+          # Solid RGB
+          write_raw('corpus/synthetic/solid_512_rgb.raw',
+                    'corpus/synthetic/solid_512_rgb.meta',
+                    [64,128,200] * (W*H), W, H, 'rgb', 8)
+
+          # Horizontal gradient RGB
+          px = []
+          for y in range(H):
+              for x in range(W):
+                  v = int(x * 255 / (W-1))
+                  px += [v, int(y*255/(H-1)), 128]
+          write_raw('corpus/synthetic/grad_512_rgb.raw',
+                    'corpus/synthetic/grad_512_rgb.meta',
+                    px, W, H, 'rgb', 8)
+
+          # Checkerboard 8px RGB
+          px = []
+          for y in range(H):
+              for x in range(W):
+                  v = 255 if (x//8 + y//8) % 2 == 0 else 0
+                  px += [v, v, v]
+          write_raw('corpus/synthetic/checker_512_rgb.raw',
+                    'corpus/synthetic/checker_512_rgb.meta',
+                    px, W, H, 'rgb', 8)
+
+          # Noise 256×256 RGB (incompressible baseline)
+          import random; random.seed(42)
+          px = [random.randint(0,255) for _ in range(256*256*3)]
+          write_raw('corpus/synthetic/noise_256_rgb.raw',
+                    'corpus/synthetic/noise_256_rgb.meta',
+                    px, 256, 256, 'rgb', 8)
+
+          # 16-bit ramp grayscale 256×256
+          px = []
+          total = 256*256
+          for i in range(total):
+              v = int(i * 65535 / (total-1))
+              px += list(struct.pack('<H', v))
+          write_raw('corpus/synthetic/ramp_256_gray16.raw',
+                    'corpus/synthetic/ramp_256_gray16.meta',
+                    px, 256, 256, 'gray', 16)
+
+          # Pixel art pattern 256×256 RGB
+          palette = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),
+                     (0,255,255),(255,0,255),(128,128,128),(255,255,255)]
+          px = []
+          for y in range(256):
+              for x in range(256):
+                  idx = ((x//8) + (y//8) * 32) % len(palette)
+                  px += list(palette[idx])
+          write_raw('corpus/synthetic/pixel_art_256_rgb.raw',
+                    'corpus/synthetic/pixel_art_256_rgb.meta',
+                    px, 256, 256, 'rgb', 8)
+
+          print("Corpus generated: 6 files")
+          PYEOF
+
+      - name: Corpus roundtrip + compression table
+        run: |
+          BIN=./target/release/mpx
+          {
+            printf 'FILE,RAW,MPX_PAETH,MPX_ICD,MPX_PAETH_PCT,MPX_ICD_PCT,ENC_MS\n'
+            for meta in corpus/synthetic/*.meta; do
+              raw="${meta%.meta}.raw"
+              [ -f "$raw" ] || continue
+              read -r W H COLOR BPP < "$meta"
+              RAW=$(wc -c < "$raw")
+              FILE=$(basename "${raw%.raw}")
+
+              # Encode with Paeth only
+              T0=$(date +%s%N)
+              "$BIN" encode "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/p.mpx 2>/dev/null
+              T1=$(date +%s%N)
+              P_BYTES=$(wc -c < /tmp/p.mpx)
+              P_MS=$(( (T1-T0)/1000000 ))
+
+              # Verify roundtrip
+              "$BIN" roundtrip "$raw" "$W" "$H" "$COLOR" "$BPP" 2>/dev/null \
+                && RT="PASS" || RT="FAIL"
+
+              # Encode with Paeth + inter-channel-delta (icd flag)
+              "$BIN" encode-icd "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/i.mpx 2>/dev/null \
+                && ICD_BYTES=$(wc -c < /tmp/i.mpx) || ICD_BYTES=$P_BYTES
+
+              P_PCT=$(awk "BEGIN{printf \"%.1f\",$P_BYTES/$RAW*100}")
+              I_PCT=$(awk "BEGIN{printf \"%.1f\",$ICD_BYTES/$RAW*100}")
+
+              printf '%s,%d,%d,%d,%s,%s,%dms [%s]\n' \
+                "$FILE" "$RAW" "$P_BYTES" "$ICD_BYTES" \
+                "$P_PCT" "$I_PCT" "$P_MS" "$RT"
+            done
+          } | tee results/corpus.csv
+
+      # ── Report generation ──────────────────────────────────────────
+      - name: Generate HTML report
+        run: |
+          python3 .github/pages/generate_report.py \
+            --build     "${{ github.run_number }}" \
+            --commit    "${GITHUB_SHA:0:8}" \
+            --branch    "${{ github.ref_name }}" \
+            --tests-d   results/test_debug.txt \
+            --tests-r   results/test_release.txt \
+            --bench     results/bench_raw.txt \
+            --corpus    results/corpus.csv \
+            --out       site/index.html
+
+      # ── Pages deployment ───────────────────────────────────────────
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site/
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      # ── Step summary ───────────────────────────────────────────────
+      - name: Publish Step Summary
+        run: |
+          echo "## MPX Build #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: \`${{ github.ref_name }}\`  Commit: \`${GITHUB_SHA:0:8}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Corpus compression table" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          cat results/corpus.csv >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Benchmark extract" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          grep -E "(time:|thrpt:)" results/bench_raw.txt | head -30 \
+            >> $GITHUB_STEP_SUMMARY || echo "(no bench output)" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "🔗 [View full visual report](${{ steps.deployment.outputs.page_url }})" \
+            >> $GITHUB_STEP_SUMMARY
