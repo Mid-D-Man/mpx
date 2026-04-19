@@ -1,37 +1,28 @@
-// Auto-generated stub
 // src/encode.rs
-//! MPX encoder pipeline.
-//!
-//! Pipeline:
-//!   1. Channel separation:    interleaved RGBARGBA... → R-plane G-plane B-plane A-plane
-//!   2. Spatial filter:        per row, per plane → residuals near zero
-//!   3. Byte-plane split:      16-bit only → split high/low bytes of each plane
-//!   4. MBFA compression:      per plane via mbfa::compress
-//!   5. Serialisation:         header + [len: u32 LE][compressed bytes] per channel
 
 use std::io;
-use crate::header::{MpxHeader, FilterType, FLAG_BYTE_PLANE_SPLIT, HEADER_SIZE};
+use crate::header::{
+    MpxHeader, FilterType, FLAG_BYTE_PLANE_SPLIT,
+    FLAG_INTER_CHANNEL_DELTA, HEADER_SIZE,
+};
 use crate::filter::{apply_filter, select_best_filter};
 
 pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
-    let w        = header.width  as usize;
-    let h        = header.height as usize;
-    let channels = header.channel_count();
-    let bps      = header.bytes_per_sample();
+    let w         = header.width  as usize;
+    let h         = header.height as usize;
+    let channels  = header.channel_count();
+    let bps       = header.bytes_per_sample();
     let row_bytes = w * channels * bps;
 
-    let expected = h * row_bytes;
-    if pixels.len() != expected {
+    if pixels.len() != h * row_bytes {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("pixel buffer size mismatch: expected {} bytes, got {}", expected, pixels.len()),
+            format!("pixel buffer: expected {} bytes got {}", h * row_bytes, pixels.len()),
         ));
     }
 
-    // ── Step 1: channel separation ────────────────────────────────────────────
-    // Deinterleave RGBARGBA... into separate planes.
-    // plane[c][row * w * bps .. (row+1) * w * bps] = channel c, all samples in row.
-    let plane_bytes = w * h * bps;
+    // ── 1. Channel deinterleave ───────────────────────────────────────────────
+    let plane_bytes = header.plane_bytes();
     let mut planes: Vec<Vec<u8>> = (0..channels).map(|_| vec![0u8; plane_bytes]).collect();
 
     for row in 0..h {
@@ -45,7 +36,27 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
-    // ── Step 2: spatial prediction filter ────────────────────────────────────
+    // ── 2. Inter-channel delta (MBFA co-design) ───────────────────────────────
+    // G = G-R, B = B-G (byte-wise wrapping).
+    // For natural photos: G-R ≈ 0, B-G ≈ 0.
+    // Combined with Paeth filter this produces near-all-zero residual planes.
+    // MBFA fold-1 generates BACKREF(offset=row_width, length=long) tokens for
+    // entire rows. Fold-2 pair encoding then compresses the ultra-regular token
+    // stream further — this is the core MBFA flourishing mechanism.
+    // Alpha stays independent (not correlated with B in general).
+    if header.inter_channel_delta() {
+        // c=1: subtract plane[0]; c=2: subtract plane[1] (before modification)
+        for c in 1..channels.min(3) {
+            let (left, right) = planes.split_at_mut(c);
+            let prev = &left[c - 1];
+            let curr = &mut right[0];
+            for i in 0..plane_bytes {
+                curr[i] = curr[i].wrapping_sub(prev[i]);
+            }
+        }
+    }
+
+    // ── 3. Spatial prediction filter ─────────────────────────────────────────
     let plane_row_bytes = header.plane_row_bytes();
     let stride          = bps;
     let filter          = header.filter_type;
@@ -55,21 +66,17 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
         let mut prev_row = vec![0u8; plane_row_bytes];
 
         for row in 0..h {
-            let row_off = row * plane_row_bytes;
-            let cur_row = &plane[row_off..row_off + plane_row_bytes];
+            let row_off  = row * plane_row_bytes;
+            let cur_row  = &plane[row_off..row_off + plane_row_bytes];
 
-            // For Adaptive: select the best filter for this specific row.
-            // The chosen filter gets stored in the compressed data implicitly
-            // because Adaptive resolves to Paeth in v1. In v2, we'd store
-            // a per-row filter byte prefix here.
-            let effective_filter = if filter == FilterType::Adaptive {
+            let effective = if filter == FilterType::Adaptive {
                 select_best_filter(cur_row, &prev_row, stride)
             } else {
                 filter.effective()
             };
 
             apply_filter(
-                effective_filter,
+                effective,
                 cur_row,
                 &prev_row,
                 &mut out[row_off..row_off + plane_row_bytes],
@@ -81,19 +88,15 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
         out
     }).collect();
 
-    // ── Step 3: byte-plane split (16-bit only) ────────────────────────────────
-    // Split each 16-bit plane into a high-byte sub-plane and low-byte sub-plane.
-    // Concatenated as [hi_bytes | lo_bytes] before MBFA.
-    // Adjacent high bytes (MSB) of floating-point-like gradients are nearly
-    // identical → MBFA LZ gets very long matches on the hi plane.
+    // ── 4. Byte-plane split (16-bit only) ─────────────────────────────────────
     if header.byte_plane_split() {
         for plane in &mut filtered_planes {
-            let n  = plane.len() / 2; // number of u16 samples
+            let n = plane.len() / 2;
             let mut hi = Vec::with_capacity(n);
             let mut lo = Vec::with_capacity(n);
             for chunk in plane.chunks_exact(2) {
-                lo.push(chunk[0]); // little-endian: low byte first
-                hi.push(chunk[1]); // high byte
+                lo.push(chunk[0]);
+                hi.push(chunk[1]);
             }
             plane.clear();
             plane.extend_from_slice(&hi);
@@ -101,33 +104,32 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
-    // ── Step 4: MBFA compress each plane ─────────────────────────────────────
+    // ── 5. MBFA compress each plane ──────────────────────────────────────────
     let compressed_planes: Vec<io::Result<Vec<u8>>> = filtered_planes
         .iter()
         .map(|plane| mbfa::compress(plane, 8))
         .collect();
 
-    // Check for errors before allocating output
-    for result in &compressed_planes {
-        if let Err(e) = result {
-            return Err(io::Error::new(e.kind(), format!("MBFA compress: {}", e)));
+    for r in &compressed_planes {
+        if let Err(e) = r {
+            return Err(io::Error::new(e.kind(), format!("MBFA: {}", e)));
         }
     }
 
-    // ── Step 5: serialize ─────────────────────────────────────────────────────
-    let total_payload: usize = compressed_planes
+    // ── 6. Serialize ──────────────────────────────────────────────────────────
+    let payload_total: usize = compressed_planes
         .iter()
         .map(|r| 4 + r.as_ref().unwrap().len())
         .sum();
 
-    let mut out = Vec::with_capacity(HEADER_SIZE + total_payload);
+    let mut out = Vec::with_capacity(HEADER_SIZE + payload_total);
     out.extend_from_slice(&header.serialize());
 
-    for result in compressed_planes {
-        let compressed = result.unwrap();
+    for r in compressed_planes {
+        let compressed = r.unwrap();
         out.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
         out.extend_from_slice(&compressed);
     }
 
     Ok(out)
-      }
+}
