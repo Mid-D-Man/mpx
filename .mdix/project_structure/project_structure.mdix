@@ -1,34 +1,90 @@
-@DATA(
-  root::
-    f("Cargo", "toml")
-    f("README", "md")
+// =============================================================================
+// TEMPLATE: MPX — MidPixel Image Format
+// Use with: mdix-scaffold generate --template .mdix/project_structure/templates/mpx.mdix
+// Mappings: project_name, description, author, github_user
+// Sibling dep: ../mbfa must exist (path dependency)
+// =============================================================================
 
+@CONFIG(
+  version    -> "1.0.0"
+  features   -> "quickfuncs,data"
+  debug_mode -> "off"
+)
+
+@QUICKFUNCS(
+  ~f<object>(name, ext)            { return { name = name, ext = ext, content = "" } }
+  ~fc<object>(name, ext, content)  { return { name = name, ext = ext, content = content } }
+  ~fremote<object>(name, ext, url) { return { name = name, ext = ext, content = "remote::" + url } }
+  ~gitkeep<object>()               { return { name = ".gitkeep", ext = "", content = "" } }
+  ~hidden<object>(seg)             { return { segment = seg } }
+)
+
+@DATA(
+  project_name = "mpx"
+  description  = "MPX — MidPixel lossless image format built on MBFA instruction-chain compression"
+  author       = "MidManStudio"
+  github_user  = "Mid-D-Man"
+
+  hidden_dirs::
+    hidden("github")
+    hidden("vscode")
+
+  post_hooks::
+    "echo 'MPX scaffold complete. Make sure ../mbfa exists as a sibling directory.'"
+    "echo 'Run: cargo test -- --nocapture to verify roundtrips'"
+
+  // ── VS Code ───────────────────────────────────────────────────────────────
+  vscode::
+    fc("extensions", "json", "{\n  \"recommendations\": [\n    \"rust-lang.rust-analyzer\",\n    \"tamasfe.even-better-toml\"\n  ]\n}\n")
+    fc("settings", "json", "{\n  \"rust-analyzer.cargo.features\": \"all\",\n  \"editor.formatOnSave\": true\n}\n")
+
+  // ── Source ────────────────────────────────────────────────────────────────
   src::
-    f("lib", "rs")
-    f("main", "rs")
+    f("lib",    "rs")
+    f("main",   "rs")
     f("header", "rs")
     f("filter", "rs")
     f("encode", "rs")
     f("decode", "rs")
 
+  // ── Integration tests ─────────────────────────────────────────────────────
   tests::
     f("roundtrip", "rs")
+    gitkeep()
 
+  // ── Criterion benchmarks ──────────────────────────────────────────────────
   benches::
     f("compare", "rs")
 
-  corpus::
-    pixel_art::
-      gitkeep()
-      f("sample", "raw")
-      fc("sample", "meta", "width: 64\nheight: 64\nchannels: 4")
-    
-    photos::
-      gitkeep()
-      
-    gradients::
-      gitkeep()
-      
-    synthetic::
-      gitkeep()
+  // ── Corpus directories (raw pixel files + meta) ───────────────────────────
+  corpus.pixel_art::
+    gitkeep()
+
+  corpus.photos::
+    gitkeep()
+
+  corpus.gradients::
+    gitkeep()
+
+  corpus.synthetic::
+    gitkeep()
+
+  // ── Scripts ───────────────────────────────────────────────────────────────
+  scripts::
+    fc("gen_corpus.sh", "", "#!/usr/bin/env bash\n# gen_corpus.sh — generate synthetic test corpus\n# Requires: ImageMagick (convert command)\nset -euo pipefail\n\nOUT=corpus/synthetic\nmkdir -p \"$OUT\"\n\necho 'Generating synthetic corpus...'\n\n# Solid colour 512x512 RGB\nconvert -size 512x512 xc:\"#4080C0\" -depth 8 \"$OUT/solid_512_rgb.png\"\nconvert \"$OUT/solid_512_rgb.png\" rgb:\"$OUT/solid_512_rgb.raw\"\necho '512 512 rgb 8' > \"$OUT/solid_512_rgb.meta\"\n\n# Horizontal gradient 512x512 RGB\nconvert -size 512x512 gradient:black-white -depth 8 \"$OUT/grad_h_512_rgb.png\"\nconvert \"$OUT/grad_h_512_rgb.png\" rgb:\"$OUT/grad_h_512_rgb.raw\"\necho '512 512 rgb 8' > \"$OUT/grad_h_512_rgb.meta\"\n\n# Checkerboard 512x512 RGB (8px tiles)\nconvert -size 512x512 pattern:checkerboard -depth 8 \"$OUT/checker_512_rgb.png\"\nconvert \"$OUT/checker_512_rgb.png\" rgb:\"$OUT/checker_512_rgb.raw\"\necho '512 512 rgb 8' > \"$OUT/checker_512_rgb.meta\"\n\n# Noise 256x256 RGB (incompressible baseline)\nconvert -size 256x256 xc: +noise Random -depth 8 \"$OUT/noise_256_rgb.png\"\nconvert \"$OUT/noise_256_rgb.png\" rgb:\"$OUT/noise_256_rgb.raw\"\necho '256 256 rgb 8' > \"$OUT/noise_256_rgb.meta\"\n\n# 16-bit ramp grayscale 256x256\nconvert -size 256x256 gradient:gray0-gray100 -depth 16 -endian LSB \"$OUT/ramp_256_gray16.png\"\nconvert \"$OUT/ramp_256_gray16.png\" gray:\"$OUT/ramp_256_gray16.raw\"\necho '256 256 gray 16' > \"$OUT/ramp_256_gray16.meta\"\n\necho 'Corpus ready in corpus/synthetic/'\n")
+    fc("bench_corpus.sh", "", "#!/usr/bin/env bash\n# bench_corpus.sh — run MPX encode/decode against every .raw in corpus/\n# and print a comparison table vs PNG (requires ImageMagick).\nset -euo pipefail\n\nBIN=\"./target/release/mpx\"\nif [ ! -f \"$BIN\" ]; then\n  cargo build --release\nfi\n\nprintf '%-35s %10s %10s %10s %10s %12s %12s\\n' \\\n  FILE RAW_BYTES PNG_BYTES MPX_BYTES PNG_PCT MPX_PCT MPX_ENC_MS\nprintf '%s\\n' \"$(printf '%.0s-' {1..100})\"\n\nfor meta in corpus/**/*.meta; do\n  raw=\"${meta%.meta}.raw\"\n  [ -f \"$raw\" ] || continue\n\n  read -r W H COLOR BPP < \"$meta\"\n  RAW_BYTES=$(wc -c < \"$raw\")\n\n  # MPX encode\n  START=$(date +%s%N)\n  \"$BIN\" encode \"$raw\" \"$W\" \"$H\" \"$COLOR\" \"$BPP\" paeth /tmp/out.mpx 2>/dev/null\n  END=$(date +%s%N)\n  MPX_BYTES=$(wc -c < /tmp/out.mpx)\n  MPX_MS=$(( (END - START) / 1000000 ))\n\n  # PNG encode via ImageMagick (for size comparison only)\n  PNG_BYTES=0\n  if command -v convert &>/dev/null; then\n    convert -size \"${W}x${H}\" -depth \"$BPP\" \"${COLOR}:${raw}\" /tmp/out_cmp.png 2>/dev/null\n    PNG_BYTES=$(wc -c < /tmp/out_cmp.png)\n  fi\n\n  PNG_PCT=$(awk \"BEGIN { printf \\\"%.1f\\\", $PNG_BYTES / $RAW_BYTES * 100 }\")\n  MPX_PCT=$(awk \"BEGIN { printf \\\"%.1f\\\", $MPX_BYTES / $RAW_BYTES * 100 }\")\n  FILE=$(basename \"${raw%.raw}\")\n\n  printf '%-35s %10d %10d %10d %9s%% %11s%% %9dms\\n' \\\n    \"$FILE\" \"$RAW_BYTES\" \"$PNG_BYTES\" \"$MPX_BYTES\" \"$PNG_PCT\" \"$MPX_PCT\" \"$MPX_MS\"\ndone\n\nrm -f /tmp/out.mpx /tmp/out_cmp.png\necho\necho 'Done. Run cargo bench for detailed per-operation numbers.'\n")
+    fc("verify_corpus.sh", "", "#!/usr/bin/env bash\n# verify_corpus.sh — roundtrip every .raw in corpus/ and assert pixel-perfect output.\nset -euo pipefail\n\nBIN=\"./target/release/mpx\"\n[ -f \"$BIN\" ] || cargo build --release\n\nPASS=0\nFAIL=0\n\nfor meta in corpus/**/*.meta; do\n  raw=\"${meta%.meta}.raw\"\n  [ -f \"$raw\" ] || continue\n  read -r W H COLOR BPP < \"$meta\"\n  FILE=$(basename \"${raw%.raw}\")\n\n  if \"$BIN\" roundtrip \"$raw\" \"$W\" \"$H\" \"$COLOR\" \"$BPP\" 2>/dev/null; then\n    echo \"PASS  $FILE\"\n    PASS=$((PASS + 1))\n  else\n    echo \"FAIL  $FILE\"\n    FAIL=$((FAIL + 1))\n  fi\ndone\n\necho\necho \"Results: $PASS passed, $FAIL failed\"\n[ \"$FAIL\" -eq 0 ] || exit 1\n")
+
+  // ── Docs ──────────────────────────────────────────────────────────────────
+  docs::
+    fc("format-spec", "md", "# MPX Format Specification\n\n## File header (32 bytes)\n\n| Offset | Size | Field         | Notes                              |\n|--------|------|---------------|------------------------------------|  \n| 0      | 4    | magic         | `0x4D 0x50 0x58 0x00`              |\n| 4      | 1    | version       | `1`                                |\n| 5      | 1    | color_type    | 0=Gray 1=GrayA 2=RGB 3=RGBA        |\n| 6      | 1    | bit_depth     | `8` or `16`                        |\n| 7      | 1    | filter_type   | 0=None 1=Sub 2=Up 3=Avg 4=Paeth 5=Adaptive |\n| 8      | 4    | width         | u32 LE                             |\n| 12     | 4    | height        | u32 LE                             |\n| 16     | 1    | channel_count | derived, cached                    |\n| 17     | 1    | flags         | bit0 = byte_plane_split            |\n| 18     | 14   | reserved      | zeros                              |\n\n## Per-channel block\n\n`[compressed_len: u32 LE][MBFA compressed bytes]`\n\nOne block per channel in color_type order (R, G, B, A for RGBA).\n\n## Compression pipeline\n\n1. Channel deinterleave\n2. Spatial prediction filter (per row)\n3. Byte-plane split (16-bit only — hi/lo byte planes concatenated)\n4. MBFA compress\n")
+    fc("benchmarks",  "md", "# MPX Benchmark Results\n\n> Update this file after each `cargo bench` run.\n\n## Encode throughput\n\n| Image type         | Size    | Filter  | Time  | MB/s |\n|--------------------|---------|---------|-------|------|\n| Gradient RGB 8bpp  | 512x512 | Paeth   | TBD   | TBD  |\n| Solid RGBA 8bpp    | 512x512 | Paeth   | TBD   | TBD  |\n| Noise RGB 8bpp     | 256x256 | Paeth   | TBD   | TBD  |\n| Ramp Gray 16bpp    | 256x256 | Paeth   | TBD   | TBD  |\n\n## Compression ratio vs PNG\n\n| Image type         | Raw     | PNG     | MPX     | PNG%  | MPX%  |\n|--------------------|---------|---------|---------|-------|-------|\n| Gradient           | TBD     | TBD     | TBD     | TBD   | TBD   |\n| Solid              | TBD     | TBD     | TBD     | TBD   | TBD   |\n| Pixel art          | TBD     | TBD     | TBD     | TBD   | TBD   |\n| Noise              | TBD     | TBD     | TBD     | TBD   | TBD   |\n")
+
+  
+  // ── Root ──────────────────────────────────────────────────────────────────
+  root::
+    fc("README", "md", "# MPX — MidPixel Image Format\n\nLossless image format built on [MBFA](../mbfa) instruction-chain compression.\n\n## Stack\n\n- Spatial prediction filter (Sub / Up / Average / Paeth / Adaptive)\n- Per-channel plane separation\n- Byte-plane split for 16-bit (hi/lo byte planes compressed independently)\n- MBFA multi-fold LZ + entropy coding\n\n## Usage\n\n```bash\n# Encode a raw pixel file\ncargo run --release -- encode image.raw 512 512 rgb 8 paeth image.mpx\n\n# Decode\ncargo run --release -- decode image.mpx recovered.raw\n\n# Roundtrip self-test\ncargo run --release -- roundtrip image.raw 512 512 rgb 8\n\n# File info\ncargo run --release -- info image.mpx\n```\n\n## Build\n\n```bash\n# Requires ../mbfa as a sibling directory\ncargo build --release\ncargo test\ncargo bench\n```\n\n## License\n\nMIT\n")
+    fc("Cargo", "toml", "[package]\nname = \"mpx\"\nversion = \"0.1.0\"\nedition = \"2021\"\nauthors = [\"[[author]]\"]\ndescription = \"[[description]]\"\nlicense = \"MIT\"\n\n[[bin]]\nname = \"mpx\"\npath = \"src/main.rs\"\n\n[lib]\nname = \"mpx\"\npath = \"src/lib.rs\"\n\n[dependencies]\nmbfa = { path = \"../mbfa\" }\n\n[dev-dependencies]\nimage     = \"0.25\"\ncriterion = { version = \"0.5\", features = [\"html_reports\"] }\n\n[[bench]]\nname    = \"compare\"\nharness = false\n")
+    fremote("LICENSE", "", "https://raw.githubusercontent.com/nicklockwood/MIT-License/master/MIT-License")
+    fc(".gitignore", "", "target/\n*.lock\n.env\n.DS_Store\n**/.DS_Store\ncorpus/**/*.raw\ncorpus/**/*.png\n")
 )
