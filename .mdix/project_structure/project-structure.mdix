@@ -1,0 +1,34 @@
+@DATA(
+  root::
+    f("Cargo", "toml")
+    f("README", "md")
+
+  src::
+    f("lib", "rs")
+    f("main", "rs")
+    f("header", "rs")
+    f("filter", "rs")
+    f("encode", "rs")
+    f("decode", "rs")
+
+  tests::
+    f("roundtrip", "rs")
+
+  benches::
+    f("compare", "rs")
+
+  corpus::
+    pixel_art::
+      gitkeep()
+      f("sample", "raw")
+      fc("sample", "meta", "width: 64\nheight: 64\nchannels: 4")
+    
+    photos::
+      gitkeep()
+      
+    gradients::
+      gitkeep()
+      
+    synthetic::
+      gitkeep()
+)
