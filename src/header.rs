@@ -1,32 +1,19 @@
-// Auto-generated stub
 // src/header.rs
-//! MPX file header — fixed 32 bytes.
-//!
-//! Layout:
-//!   [0..4]   magic:       0x4D 0x50 0x58 0x00  ("MPX\0")
-//!   [4]      version:     u8 = 1
-//!   [5]      color_type:  u8
-//!   [6]      bit_depth:   u8  (8 or 16)
-//!   [7]      filter_type: u8
-//!   [8..12]  width:       u32 LE
-//!   [12..16] height:      u32 LE
-//!   [16]     channel_count: u8  (derived, stored for fast reads)
-//!   [17]     flags:       u8
-//!   [18..32] reserved:    zeros
-//!
-//! After the header: one compressed block per channel.
-//! Each block: [compressed_len: u32 LE] [MBFA-compressed bytes]
 
 pub const MAGIC:       [u8; 4] = [0x4D, 0x50, 0x58, 0x00];
 pub const VERSION:     u8      = 1;
 pub const HEADER_SIZE: usize   = 32;
 
-/// Bit in `flags`: split 16-bit samples into high-byte and low-byte planes
-/// before MBFA compression. Dramatically improves LZ efficiency on smooth
-/// gradients. Always set when bit_depth=16. Ignored for 8-bit images.
-pub const FLAG_BYTE_PLANE_SPLIT: u8 = 0b0000_0001;
+/// bit 0: split 16-bit samples into hi/lo byte planes before MBFA.
+/// Near-constant hi-byte planes give MBFA very long LZ back-references.
+pub const FLAG_BYTE_PLANE_SPLIT:      u8 = 0b0000_0001;
 
-// ── Color type ────────────────────────────────────────────────────────────────
+/// bit 1: inter-channel delta — G=(G-R), B=(B-G), applied BEFORE spatial filter.
+/// For natural photos, these deltas cluster near zero, producing near-uniform
+/// residual planes. MBFA's fold-1 then generates a token stream dominated by
+/// BACKREF(offset=row_width, length=large), which fold-2 pair encoding
+/// compresses further via Cantor pairing of identical operands.
+pub const FLAG_INTER_CHANNEL_DELTA:   u8 = 0b0000_0010;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorType {
@@ -57,16 +44,6 @@ impl ColorType {
     }
 }
 
-// ── Filter type ───────────────────────────────────────────────────────────────
-
-/// Spatial prediction filter applied per row before MBFA compression.
-/// Converts pixel values into near-zero residuals that LZ matches more
-/// densely. Paeth is the best general-purpose choice (same as PNG).
-///
-/// NOTE: `Adaptive` in v1 selects Paeth for all rows. True per-row
-/// adaptive mode (store 1 filter byte per row, pick best per row like
-/// PNG's adaptive mode) is a v2 TODO — requires changing the plane
-/// serialisation format to prefix each row with its filter byte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterType {
     None     = 0,
@@ -74,7 +51,6 @@ pub enum FilterType {
     Up       = 2,
     Average  = 3,
     Paeth    = 4,
-    /// v1: auto-selects Paeth. v2: per-row best-filter selection.
     Adaptive = 5,
 }
 
@@ -91,8 +67,6 @@ impl FilterType {
         }
     }
 
-    /// Resolve the effective filter for encode/decode.
-    /// Adaptive maps to Paeth in v1.
     pub fn effective(self) -> FilterType {
         match self {
             Self::Adaptive => Self::Paeth,
@@ -100,8 +74,6 @@ impl FilterType {
         }
     }
 }
-
-// ── Header ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub struct MpxHeader {
@@ -114,28 +86,17 @@ pub struct MpxHeader {
 }
 
 impl MpxHeader {
-    pub fn channel_count(&self) -> usize {
-        self.color_type.channel_count()
-    }
+    pub fn channel_count(&self)    -> usize { self.color_type.channel_count() }
+    pub fn bytes_per_sample(&self) -> usize { (self.bit_depth / 8) as usize }
+    pub fn plane_row_bytes(&self)  -> usize { self.width as usize * self.bytes_per_sample() }
+    pub fn plane_bytes(&self)      -> usize { self.height as usize * self.plane_row_bytes() }
 
-    /// True when the 16-bit byte-plane split flag is set.
     pub fn byte_plane_split(&self) -> bool {
         self.bit_depth == 16 && (self.flags & FLAG_BYTE_PLANE_SPLIT) != 0
     }
 
-    /// Bytes per sample (1 for 8-bit, 2 for 16-bit).
-    pub fn bytes_per_sample(&self) -> usize {
-        (self.bit_depth / 8) as usize
-    }
-
-    /// Row stride in bytes for one channel plane.
-    pub fn plane_row_bytes(&self) -> usize {
-        self.width as usize * self.bytes_per_sample()
-    }
-
-    /// Total bytes for one channel plane (uncompressed).
-    pub fn plane_bytes(&self) -> usize {
-        self.height as usize * self.plane_row_bytes()
+    pub fn inter_channel_delta(&self) -> bool {
+        self.channel_count() > 1 && (self.flags & FLAG_INTER_CHANNEL_DELTA) != 0
     }
 
     pub fn serialize(&self) -> [u8; HEADER_SIZE] {
@@ -149,52 +110,42 @@ impl MpxHeader {
         buf[12..16].copy_from_slice(&self.height.to_le_bytes());
         buf[16] = self.channel_count() as u8;
         buf[17] = self.flags;
-        // [18..32] reserved, zero
         buf
     }
 
     pub fn parse(data: &[u8]) -> std::io::Result<Self> {
         if data.len() < HEADER_SIZE {
-            return Err(err("MPX header too short"));
+            return Err(e("MPX header too short"));
         }
-        if data[0..4] != MAGIC {
-            return Err(err("not an MPX file (bad magic)"));
-        }
-        if data[4] != VERSION {
-            return Err(err(format!("unsupported MPX version: {}", data[4])));
-        }
+        if data[0..4] != MAGIC       { return Err(e("not an MPX file")); }
+        if data[4]    != VERSION     { return Err(e(format!("unsupported version {}", data[4]))); }
 
         let color_type = ColorType::from_u8(data[5])
-            .ok_or_else(|| err(format!("unknown color type: {}", data[5])))?;
-
+            .ok_or_else(|| e(format!("unknown color_type {}", data[5])))?;
         let bit_depth = data[6];
         if bit_depth != 8 && bit_depth != 16 {
-            return Err(err(format!("unsupported bit depth: {} (must be 8 or 16)", bit_depth)));
+            return Err(e(format!("unsupported bit_depth {}", bit_depth)));
         }
-
         let filter_type = FilterType::from_u8(data[7])
-            .ok_or_else(|| err(format!("unknown filter type: {}", data[7])))?;
+            .ok_or_else(|| e(format!("unknown filter_type {}", data[7])))?;
 
         let width  = u32::from_le_bytes(data[8..12].try_into().unwrap());
         let height = u32::from_le_bytes(data[12..16].try_into().unwrap());
         let flags  = data[17];
 
-        if width == 0 || height == 0 {
-            return Err(err("zero-dimension image"));
-        }
+        if width == 0 || height == 0 { return Err(e("zero dimension")); }
 
-        // Sanity: width * height must not overflow usize
-        let _ = (width as usize)
+        (width as usize)
             .checked_mul(height as usize)
             .and_then(|n| n.checked_mul(color_type.channel_count()))
             .and_then(|n| n.checked_mul((bit_depth / 8) as usize))
-            .ok_or_else(|| err("image dimensions overflow usize"))?;
+            .ok_or_else(|| e("image dimensions overflow"))?;
 
         Ok(MpxHeader { color_type, bit_depth, filter_type, width, height, flags })
     }
 }
 
 #[inline]
-fn err(msg: impl Into<String>) -> std::io::Error {
+fn e(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
-         }
+}
