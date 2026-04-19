@@ -1,0 +1,83 @@
+name: MPX CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout MBFA (sibling repo)
+        uses: actions/checkout@v4
+        with:
+          repository: Mid-D-Man/mbfa
+          path: ../mbfa
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+            ../mbfa/target
+          key: mpx-${{ hashFiles('Cargo.toml', '../mbfa/Cargo.toml') }}
+          restore-keys: mpx-
+
+      - name: Check format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Tests (debug)
+        run: cargo test -- --nocapture
+
+      - name: Tests (release)
+        run: cargo test --release -- --nocapture
+
+  bench-report:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout MBFA
+        uses: actions/checkout@v4
+        with:
+          repository: Mid-D-Man/mbfa
+          path: ../mbfa
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run benchmarks
+        run: cargo bench --bench compare 2>&1 | tee bench_raw.txt
+
+      - name: Publish benchmark summary
+        run: |
+          echo "## MPX Benchmark Report — Build #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Branch: \`${{ github.ref_name }}\`  Commit: \`${GITHUB_SHA:0:8}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          grep -E "(time:|thrpt:)" bench_raw.txt | head -40 >> $GITHUB_STEP_SUMMARY || true
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload bench artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report
+          path: bench_raw.txt
+          retention-days: 30
