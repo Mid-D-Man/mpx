@@ -1,22 +1,30 @@
+# mpx/.github/workflows/ci.yml
 name: MPX CI
+
+# ── Toggle ────────────────────────────────────────────────────────────────────
+# Set AUTO_RUN_ENABLED to 'false' to pause all automatic runs.
+# workflow_dispatch always runs regardless.
+env:
+  AUTO_RUN_ENABLED: 'true'
 
 on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    if: ${{ env.AUTO_RUN_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout MBFA (sibling repo)
-        uses: actions/checkout@v4
-        with:
-          repository: Mid-D-Man/mbfa
-          path: ../mbfa
+      - name: Checkout MBFA (sibling path dependency)
+        run: |
+          git clone "https://github.com/Mid-D-Man/mbfa.git" \
+            "$(dirname "$GITHUB_WORKSPACE")/mbfa"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -48,16 +56,18 @@ jobs:
 
   bench-report:
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      (env.AUTO_RUN_ENABLED == 'true' || github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch'
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Checkout MBFA
-        uses: actions/checkout@v4
-        with:
-          repository: Mid-D-Man/mbfa
-          path: ../mbfa
+      - name: Checkout MBFA (sibling path dependency)
+        run: |
+          git clone "https://github.com/Mid-D-Man/mbfa.git" \
+            "$(dirname "$GITHUB_WORKSPACE")/mbfa"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
