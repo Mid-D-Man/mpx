@@ -1,9 +1,16 @@
+# mpx/.github/workflows/pages.yml
 name: MPX — Test, Bench, Pages
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
+
+# ── Toggle ────────────────────────────────────────────────────────────────────
+# Set AUTO_RUN_ENABLED to 'false' to pause all automatic runs.
+# workflow_dispatch always runs regardless of this flag.
+env:
+  AUTO_RUN_ENABLED: 'true'
 
 permissions:
   contents: read
@@ -15,10 +22,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ─────────────────────────────────────────────────────────────────
   build-and-report:
-  # ─────────────────────────────────────────────────────────────────
     runs-on: ubuntu-latest
+    if: ${{ env.AUTO_RUN_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
     environment:
       name: github-pages
       url:  ${{ steps.deployment.outputs.page_url }}
@@ -27,11 +33,10 @@ jobs:
       - name: Checkout MPX
         uses: actions/checkout@v4
 
-      - name: Checkout MBFA (sibling)
-        uses: actions/checkout@v4
-        with:
-          repository: Mid-D-Man/mbfa
-          path: ../mbfa
+      - name: Checkout MBFA (sibling path dependency)
+        run: |
+          git clone "https://github.com/Mid-D-Man/mbfa.git" \
+            "$(dirname "$GITHUB_WORKSPACE")/mbfa"
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -81,7 +86,6 @@ jobs:
       - name: Generate synthetic corpus (Rust)
         run: |
           mkdir -p corpus/synthetic
-          # Solid colour 512×512 RGB
           python3 - <<'PYEOF'
           import struct, os
 
@@ -94,12 +98,10 @@ jobs:
 
           W, H = 512, 512
 
-          # Solid RGB
           write_raw('corpus/synthetic/solid_512_rgb.raw',
                     'corpus/synthetic/solid_512_rgb.meta',
                     [64,128,200] * (W*H), W, H, 'rgb', 8)
 
-          # Horizontal gradient RGB
           px = []
           for y in range(H):
               for x in range(W):
@@ -109,7 +111,6 @@ jobs:
                     'corpus/synthetic/grad_512_rgb.meta',
                     px, W, H, 'rgb', 8)
 
-          # Checkerboard 8px RGB
           px = []
           for y in range(H):
               for x in range(W):
@@ -119,14 +120,12 @@ jobs:
                     'corpus/synthetic/checker_512_rgb.meta',
                     px, W, H, 'rgb', 8)
 
-          # Noise 256×256 RGB (incompressible baseline)
           import random; random.seed(42)
           px = [random.randint(0,255) for _ in range(256*256*3)]
           write_raw('corpus/synthetic/noise_256_rgb.raw',
                     'corpus/synthetic/noise_256_rgb.meta',
                     px, 256, 256, 'rgb', 8)
 
-          # 16-bit ramp grayscale 256×256
           px = []
           total = 256*256
           for i in range(total):
@@ -136,7 +135,6 @@ jobs:
                     'corpus/synthetic/ramp_256_gray16.meta',
                     px, 256, 256, 'gray', 16)
 
-          # Pixel art pattern 256×256 RGB
           palette = [(255,0,0),(0,255,0),(0,0,255),(255,255,0),
                      (0,255,255),(255,0,255),(128,128,128),(255,255,255)]
           px = []
@@ -163,18 +161,15 @@ jobs:
               RAW=$(wc -c < "$raw")
               FILE=$(basename "${raw%.raw}")
 
-              # Encode with Paeth only
               T0=$(date +%s%N)
               "$BIN" encode "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/p.mpx 2>/dev/null
               T1=$(date +%s%N)
               P_BYTES=$(wc -c < /tmp/p.mpx)
               P_MS=$(( (T1-T0)/1000000 ))
 
-              # Verify roundtrip
               "$BIN" roundtrip "$raw" "$W" "$H" "$COLOR" "$BPP" 2>/dev/null \
                 && RT="PASS" || RT="FAIL"
 
-              # Encode with Paeth + inter-channel-delta (icd flag)
               "$BIN" encode-icd "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/i.mpx 2>/dev/null \
                 && ICD_BYTES=$(wc -c < /tmp/i.mpx) || ICD_BYTES=$P_BYTES
 
