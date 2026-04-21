@@ -1,16 +1,15 @@
 # mpx/.github/workflows/pages.yml
 name: MPX — Test, Bench, Pages
 
+# To pause automatic runs, go to:
+#   Settings → Secrets and variables → Actions → Variables
+# and set AUTO_RUN_ENABLED = false
+# workflow_dispatch always runs regardless of that variable.
+
 on:
   push:
     branches: [main]
   workflow_dispatch:
-
-# ── Toggle ────────────────────────────────────────────────────────────────────
-# Set AUTO_RUN_ENABLED to 'false' to pause all automatic runs.
-# workflow_dispatch always runs regardless of this flag.
-env:
-  AUTO_RUN_ENABLED: 'true'
 
 permissions:
   contents: read
@@ -24,7 +23,7 @@ concurrency:
 jobs:
   build-and-report:
     runs-on: ubuntu-latest
-    if: ${{ env.AUTO_RUN_ENABLED == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ vars.AUTO_RUN_ENABLED != 'false' || github.event_name == 'workflow_dispatch' }}
     environment:
       name: github-pages
       url:  ${{ steps.deployment.outputs.page_url }}
@@ -35,7 +34,9 @@ jobs:
 
       - name: Checkout MBFA (sibling path dependency)
         run: |
-          git clone "https://github.com/Mid-D-Man/mbfa.git" \
+          git clone --depth 1 "https://github.com/Mid-D-Man/mbfa.git" \
+            "$(dirname "$GITHUB_WORKSPACE")/mbfa"
+          git config --global --add safe.directory \
             "$(dirname "$GITHUB_WORKSPACE")/mbfa"
 
       - name: Install Rust stable
