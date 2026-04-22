@@ -6,7 +6,6 @@ name: MPX — Test, Bench, Pages
 # and set AUTO_RUN_ENABLED = false
 # workflow_dispatch always runs regardless of that variable.
 
-
 on:
   push:
     branches: [main]
@@ -75,17 +74,34 @@ jobs:
           echo "EXIT_RELEASE=$?" >> "$GITHUB_ENV"
 
       # ── Benchmarks ─────────────────────────────────────────────────
+      # Image sizes in compare.rs are capped at 128×128.
+      # MBFA on larger images takes 500ms+ per encode; Criterion would
+      # spin for hours. Small sizes keep each iteration under ~5ms.
+      #
+      # --output-format bencher  → lines like:
+      #   test bench/... ... bench: 1,234 ns/iter (+/- 56)
+      # parsed by generate_report.py:parse_bench().
+      #
+      # --measurement-time 3 --sample-size 10  → each benchmark finishes
+      # in ~3s regardless of iteration speed; total suite < 5 min.
+      #
+      # 2>/dev/null  → drops MBFA's verbose diagnostic output (printed to
+      # stderr) so bench_raw.txt contains only Criterion's bencher lines.
       - name: Build release binary
         run: cargo build --release
 
       - name: Run criterion benchmarks
+        timeout-minutes: 10
         run: |
           cargo bench --bench compare -- \
             --output-format bencher \
-            2>&1 | tee results/bench_raw.txt || true
+            --measurement-time 3 \
+            --sample-size 10 \
+            2>/dev/null | tee results/bench_raw.txt || true
+          echo "Benchmark lines captured: $(grep -c 'bench:' results/bench_raw.txt || echo 0)"
 
       # ── Corpus ─────────────────────────────────────────────────────
-      - name: Generate synthetic corpus (Rust)
+      - name: Generate synthetic corpus (Python)
         run: |
           mkdir -p corpus/synthetic
           python3 - <<'PYEOF'
@@ -172,8 +188,10 @@ jobs:
               "$BIN" roundtrip "$raw" "$W" "$H" "$COLOR" "$BPP" 2>/dev/null \
                 && RT="PASS" || RT="FAIL"
 
-              "$BIN" encode-icd "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/i.mpx 2>/dev/null \
-                && ICD_BYTES=$(wc -c < /tmp/i.mpx) || ICD_BYTES=$P_BYTES
+              # encode-icd is not a separate subcommand — ICD is applied
+              # automatically for RGB/RGBA in the standard encode path.
+              # Both columns intentionally show the same value.
+              ICD_BYTES=$P_BYTES
 
               P_PCT=$(awk "BEGIN{printf \"%.1f\",$P_BYTES/$RAW*100}")
               I_PCT=$(awk "BEGIN{printf \"%.1f\",$ICD_BYTES/$RAW*100}")
@@ -222,10 +240,10 @@ jobs:
           cat results/corpus.csv >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Benchmark extract" >> $GITHUB_STEP_SUMMARY
+          echo "### Benchmark extract (bencher format)" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          grep -E "(time:|thrpt:)" results/bench_raw.txt | head -30 \
-            >> $GITHUB_STEP_SUMMARY || echo "(no bench output)" >> $GITHUB_STEP_SUMMARY
+          grep 'bench:' results/bench_raw.txt | head -40 \
+            >> $GITHUB_STEP_SUMMARY || echo "(no bench output yet)" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "🔗 [View full visual report](${{ steps.deployment.outputs.page_url }})" \
