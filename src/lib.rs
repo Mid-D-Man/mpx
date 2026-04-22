@@ -16,22 +16,23 @@ use std::io;
 
 /// Encode raw interleaved pixels to MPX.
 ///
-/// `inter_channel_delta`: set true for natural photos — makes G=(G-R), B=(B-G)
-/// before spatial filtering. Creates near-zero residual planes that MBFA's
-/// multi-fold compresses extremely well (long identical BACKREF token runs).
+/// Inter-channel delta (G = G−R, B = B−G) is automatically enabled for
+/// RGB and RGBA images. Single-channel images (Gray, GrayA) do not use it.
 pub fn encode_image(
-    width:               u32,
-    height:              u32,
-    color_type:          ColorType,
-    bit_depth:           u8,
-    filter:              FilterType,
-    inter_channel_delta: bool,
-    pixels:              &[u8],
+    width:      u32,
+    height:     u32,
+    color_type: ColorType,
+    bit_depth:  u8,
+    filter:     FilterType,
+    pixels:     &[u8],
 ) -> io::Result<Vec<u8>> {
     let mut flags = 0u8;
-    if bit_depth == 16            { flags |= FLAG_BYTE_PLANE_SPLIT; }
-    if inter_channel_delta
-        && color_type.channel_count() > 1 { flags |= FLAG_INTER_CHANNEL_DELTA; }
+    if bit_depth == 16 {
+        flags |= FLAG_BYTE_PLANE_SPLIT;
+    }
+    if color_type.channel_count() >= 3 {
+        flags |= FLAG_INTER_CHANNEL_DELTA;
+    }
 
     let header = MpxHeader { color_type, bit_depth, filter_type: filter, width, height, flags };
     encode(&header, pixels)
