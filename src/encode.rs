@@ -37,19 +37,26 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     // ── 2. Inter-channel delta (MBFA co-design) ───────────────────────────────
-    // G = G-R, B = B-G (byte-wise wrapping).
-    // For natural photos: G-R ≈ 0, B-G ≈ 0.
-    // Combined with Paeth filter this produces near-all-zero residual planes.
-    // MBFA fold-1 generates BACKREF(offset=row_width, length=long) tokens for
-    // entire rows. Fold-2 pair encoding then compresses the ultra-regular token
-    // stream further — this is the core MBFA flourishing mechanism.
-    // Alpha stays independent (not correlated with B in general).
+    // G = G-R, B = B-G (using ORIGINAL values, not already-modified planes).
+    //
+    // BUG FIX: The original code mutated planes[1] (G→G-R) before computing
+    // planes[2] = B - planes[1], which gave B - (G-R) instead of B - G.
+    // Only ramp_256_gray16 (1-channel Gray) was passing because ICD is skipped
+    // for single-channel images.
+    //
+    // Fix: snapshot all original channel planes before the delta loop so each
+    // subtraction always references the pre-delta value of the previous channel.
+    //
+    // Decoder reconstructs in forward order:
+    //   c=1: G = (G-R) + R = G_orig  ✓
+    //   c=2: B = (B-G) + G_orig = B  ✓  (planes[1] already restored to G_orig)
     if header.inter_channel_delta() {
-        // c=1: subtract plane[0]; c=2: subtract plane[1] (before modification)
+        let originals: Vec<Vec<u8>> = (0..channels.min(3))
+            .map(|c| planes[c].clone())
+            .collect();
         for c in 1..channels.min(3) {
-            let (left, right) = planes.split_at_mut(c);
-            let prev = &left[c - 1];
-            let curr = &mut right[0];
+            let prev = &originals[c - 1];
+            let curr = &mut planes[c];
             for i in 0..plane_bytes {
                 curr[i] = curr[i].wrapping_sub(prev[i]);
             }
@@ -132,4 +139,4 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     Ok(out)
-}
+                }
