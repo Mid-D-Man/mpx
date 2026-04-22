@@ -1,19 +1,22 @@
-// Auto-generated stub
 // benches/compare.rs
 //! Criterion benchmarks for MPX encode/decode.
 //!
 //! Run:  cargo bench
 //! Run:  cargo bench -- --output-format bencher 2>&1 | tee bench_results.txt
 //!
+//! IMPORTANT — keep image sizes SMALL (≤128×128).
+//! MBFA's encode path does chain discovery and fold attempts that scale
+//! super-linearly with input size. A 512×512 image takes ~500ms per encode;
+//! Criterion would need ~50 s per benchmark group just to complete 100 samples.
+//! Using 64×64 / 128×128 keeps each iteration under 5ms and lets the suite
+//! finish in under 2 minutes total.
+//!
 //! What we measure:
 //!   1. Encode time by image type and filter
 //!   2. Decode time
-//!   3. Throughput (MB/s) — more useful than raw latency
-//!
-//! vs PNG: run separately with the `image` crate's PNG encoder/decoder
-//! and compare the printed numbers manually. Automated PNG comparison
-//! is in the integration test `tests/vs_png.rs` (TODO once corpus exists).
+//!   3. Throughput (MB/s)
 
+use std::time::Duration;
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use mpx::{ColorType, FilterType, encode_image, decode_image};
 
@@ -23,8 +26,8 @@ fn gradient_rgb(w: usize, h: usize) -> Vec<u8> {
     let mut px = Vec::with_capacity(w * h * 3);
     for y in 0..h {
         for x in 0..w {
-            px.push(((x * 255) / w) as u8);
-            px.push(((y * 255) / h) as u8);
+            px.push(((x * 255) / w.max(1)) as u8);
+            px.push(((y * 255) / h.max(1)) as u8);
             px.push(128u8);
         }
     }
@@ -46,7 +49,7 @@ fn lcg_noise_rgb(w: usize, h: usize) -> Vec<u8> {
 fn ramp_gray16(w: usize, h: usize) -> Vec<u8> {
     let total = (w * h) as u32;
     (0..w * h).flat_map(|i| {
-        let v: u16 = ((i as u32 * 65535) / total) as u16;
+        let v: u16 = ((i as u32 * 65535) / total.max(1)) as u16;
         v.to_le_bytes()
     }).collect()
 }
@@ -55,12 +58,13 @@ fn ramp_gray16(w: usize, h: usize) -> Vec<u8> {
 
 fn bench_encode_gradient(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode/gradient_rgb");
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
 
-    for &size in &[64usize, 256, 512, 1024] {
+    // Max 128×128 — 512×512 takes ~500ms/iter and would stall CI for hours.
+    for &size in &[32usize, 64, 128] {
         let pixels = gradient_rgb(size, size);
-        let raw_bytes = pixels.len() as u64;
-        group.throughput(Throughput::Bytes(raw_bytes));
-
+        group.throughput(Throughput::Bytes(pixels.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}x{}", size, size)),
             &pixels,
@@ -80,12 +84,12 @@ fn bench_encode_gradient(c: &mut Criterion) {
 
 fn bench_encode_solid(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode/solid_rgba");
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
 
-    for &size in &[256usize, 512, 1024] {
-        let pixels    = solid_rgba(size, size);
-        let raw_bytes = pixels.len() as u64;
-        group.throughput(Throughput::Bytes(raw_bytes));
-
+    for &size in &[32usize, 64, 128] {
+        let pixels = solid_rgba(size, size);
+        group.throughput(Throughput::Bytes(pixels.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}x{}", size, size)),
             &pixels,
@@ -105,12 +109,14 @@ fn bench_encode_solid(c: &mut Criterion) {
 
 fn bench_encode_noise(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode/noise_rgb");
-    let size      = 256usize;
-    let pixels    = lcg_noise_rgb(size, size);
-    let raw_bytes = pixels.len() as u64;
-    group.throughput(Throughput::Bytes(raw_bytes));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
 
-    group.bench_function("256x256", |b| {
+    // Noise is incompressible — MBFA exits early, so larger sizes are OK here.
+    let size  = 128usize;
+    let pixels = lcg_noise_rgb(size, size);
+    group.throughput(Throughput::Bytes(pixels.len() as u64));
+    group.bench_function("128x128", |b| {
         b.iter(|| {
             encode_image(
                 size as u32, size as u32,
@@ -124,12 +130,12 @@ fn bench_encode_noise(c: &mut Criterion) {
 
 fn bench_encode_16bit(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode/16bit_gray");
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
 
-    for &size in &[256usize, 512] {
-        let pixels    = ramp_gray16(size, size);
-        let raw_bytes = pixels.len() as u64;
-        group.throughput(Throughput::Bytes(raw_bytes));
-
+    for &size in &[32usize, 64] {
+        let pixels = ramp_gray16(size, size);
+        group.throughput(Throughput::Bytes(pixels.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}x{}", size, size)),
             &pixels,
@@ -151,16 +157,16 @@ fn bench_encode_16bit(c: &mut Criterion) {
 
 fn bench_decode_gradient(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode/gradient_rgb");
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
 
-    for &size in &[64usize, 256, 512] {
+    for &size in &[32usize, 64, 128] {
         let pixels  = gradient_rgb(size, size);
         let encoded = encode_image(
             size as u32, size as u32,
             ColorType::Rgb, 8, FilterType::Paeth, &pixels,
         ).unwrap();
-        let compressed_bytes = encoded.len() as u64;
-        group.throughput(Throughput::Bytes(compressed_bytes));
-
+        group.throughput(Throughput::Bytes(encoded.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}x{}", size, size)),
             &encoded,
@@ -172,16 +178,17 @@ fn bench_decode_gradient(c: &mut Criterion) {
 
 fn bench_decode_solid(c: &mut Criterion) {
     let mut group = c.benchmark_group("decode/solid_rgba");
-    let size      = 512usize;
-    let pixels    = solid_rgba(size, size);
-    let encoded   = encode_image(
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
+
+    let size    = 64usize;
+    let pixels  = solid_rgba(size, size);
+    let encoded = encode_image(
         size as u32, size as u32,
         ColorType::Rgba, 8, FilterType::Paeth, &pixels,
     ).unwrap();
-    let compressed_bytes = encoded.len() as u64;
-    group.throughput(Throughput::Bytes(compressed_bytes));
-
-    group.bench_function("512x512", |b| {
+    group.throughput(Throughput::Bytes(encoded.len() as u64));
+    group.bench_function("64x64", |b| {
         b.iter(|| decode_image(black_box(&encoded)).unwrap())
     });
     group.finish();
@@ -191,8 +198,11 @@ fn bench_decode_solid(c: &mut Criterion) {
 
 fn bench_filters_encode(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode/filter_comparison");
-    let (w, h)    = (256usize, 256usize);
-    let pixels    = gradient_rgb(w, h);
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
+
+    let (w, h) = (64usize, 64usize);
+    let pixels = gradient_rgb(w, h);
     group.throughput(Throughput::Bytes(pixels.len() as u64));
 
     for filter in [
