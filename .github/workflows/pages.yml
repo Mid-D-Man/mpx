@@ -53,7 +53,7 @@ jobs:
             ~/.cargo/git
             target
             ../mbfa/target
-          key: mpx-pages-${{ hashFiles('Cargo.toml', '../mbfa/Cargo.toml') }}
+          key: mpx-pages-${{ hashFiles('Cargo.toml') }}
           restore-keys: mpx-pages-
 
       # ── Lint ───────────────────────────────────────────────────────
