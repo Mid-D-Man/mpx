@@ -1,4 +1,3 @@
-// Auto-generated stub
 // src/filter.rs
 //! Spatial prediction filters applied per row, per channel plane.
 //!
@@ -41,7 +40,6 @@ pub fn apply_filter(
         FilterType::Up      => encode_up(row, prev, out),
         FilterType::Average => encode_average(row, prev, out, stride),
         FilterType::Paeth   => encode_paeth(row, prev, out, stride),
-        // Adaptive and its effective() fallback are already handled above.
         _ => unreachable!(),
     }
 }
@@ -118,7 +116,6 @@ fn decode_up(row: &mut [u8], prev: &[u8]) {
 
 fn decode_average(row: &mut [u8], prev: &[u8], stride: usize) {
     for i in 0..row.len() {
-        // a is already reconstructed by the time we reach it (left-to-right)
         let a   = if i >= stride { row[i - stride] } else { 0u8 };
         let b   = prev[i];
         let avg = ((a as u16 + b as u16) >> 1) as u8;
@@ -176,8 +173,6 @@ pub fn select_best_filter(
 
     for &filter in &candidates {
         apply_filter(filter, row, prev, &mut tmp, stride);
-        // Sum absolute values — wrapping bytes, so 255 = -1 has high abs value.
-        // Map to signed first: treat values > 127 as negative residuals.
         let sum: u64 = tmp.iter().map(|&b| {
             let s = b as i8;
             s.unsigned_abs() as u64
@@ -197,10 +192,9 @@ mod tests {
 
     fn roundtrip(filter: FilterType, row: &[u8], prev: &[u8], stride: usize) {
         let mut filtered   = vec![0u8; row.len()];
-        let mut prev_owned = prev.to_vec();
+        let prev_owned = prev.to_vec();
         apply_filter(filter, row, &prev_owned, &mut filtered, stride);
 
-        // Decoder gets the filtered data and reconstructs
         let mut reconstructed = filtered.clone();
         undo_filter(filter, &mut reconstructed, &prev_owned, stride);
 
@@ -231,9 +225,14 @@ mod tests {
 
     #[test]
     fn paeth_known_values() {
-        // PNG spec example: a=10, b=20, c=15 → paeth should return 10
-        assert_eq!(paeth(10, 20, 15), 10);
-        // a=10, b=10, c=5 → p=15, pa=5, pb=5, pc=10 → a or b (tie goes to a)
+        // a=10, b=20, c=15:
+        // p = 10+20-15 = 15  →  pa=|15-10|=5, pb=|15-20|=5, pc=|15-15|=0
+        // pc is smallest → return c = 15
+        assert_eq!(paeth(10, 20, 15), 15);
+
+        // a=10, b=10, c=5:
+        // p = 10+10-5 = 15  →  pa=|15-10|=5, pb=|15-10|=5, pc=|15-5|=10
+        // pa <= pb AND pa <= pc → return a = 10
         assert_eq!(paeth(10, 10, 5), 10);
     }
 
@@ -247,4 +246,4 @@ mod tests {
         assert_ne!(chosen, FilterType::None);
         println!("select_best for gradient: {:?}", chosen);
     }
-      }
+}
