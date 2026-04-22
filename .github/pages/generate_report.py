@@ -42,7 +42,7 @@ def parse_tests(path: str) -> dict:
                 if m:
                     name, status = m.group(1), m.group(2)
                     tests.append({"name": name, "status": status})
-                    if status == "ok":      passed += 1
+                    if status == "ok":       passed += 1
                     elif status == "FAILED": failed += 1
     except FileNotFoundError:
         pass
@@ -51,25 +51,85 @@ def parse_tests(path: str) -> dict:
 
 def parse_bench(path: str) -> list:
     """
-    Parse --output-format bencher output.
-    Lines like: test encode/gradient/256x256 ... bench: 1,234,567 ns/iter (+/- 12,345)
-    Returns [{name, ns_per_iter, variance}]
+    Parse Criterion --output-format bencher output.
+
+    Criterion normally emits one-liners:
+      test NAME ... bench:   1,234,567 ns/iter (+/- 12,345)
+
+    However, MBFA prints verbose diagnostics to stdout during benchmarking.
+    This interleaves with Criterion's output, splitting the test-name part
+    from the bench-result part across many lines:
+
+      test encode/gradient_rgb/32x32 ...
+      Original size: 2097152 bits ...
+      chain_limit ...
+      ...many MBFA lines...
+      bench:     1014037 ns/iter (+/- 20624)
+
+    We handle both formats:
+      1. Full one-liner (regex matches directly)
+      2. Split: remember the last "test NAME ..." line, pair it with the
+         next "bench: N ns/iter" line encountered — ignoring all MBFA
+         diagnostics in between.
+
+    Returns [{name, ns, var}]
     """
     results = []
     try:
         with open(path) as f:
-            for line in f:
-                m = re.match(
-                    r"^test (.+?) \.\.\. bench:\s+([\d,]+) ns/iter \(\+/- ([\d,]+)\)",
-                    line.strip()
-                )
-                if m:
-                    name = m.group(1).strip()
-                    ns   = int(m.group(2).replace(",", ""))
-                    var  = int(m.group(3).replace(",", ""))
-                    results.append({"name": name, "ns": ns, "var": var})
+            lines = f.readlines()
     except FileNotFoundError:
-        pass
+        return results
+
+    RE_ANSI = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+    # Full one-liner: "test NAME ... bench:   N ns/iter (+/- N)"
+    RE_FULL = re.compile(
+        r'^test (.+?) \.\.\. bench:\s+([\d,]+) ns/iter \(\+/- ([\d,]+)\)'
+    )
+    # Test name only (trailing "..." may have extra spaces / no bench yet)
+    RE_TEST = re.compile(r'^test (.+?) \.\.\.')
+    # Bare bench line (possibly preceded by many MBFA diagnostic lines)
+    RE_BENCH = re.compile(r'^\s*bench:\s+([\d,]+) ns/iter \(\+/- ([\d,]+)\)')
+
+    pending_name = None
+
+    for raw_line in lines:
+        line = RE_ANSI.sub('', raw_line).rstrip()
+
+        # ── Try full one-liner first ──────────────────────────────────────────
+        m = RE_FULL.match(line)
+        if m:
+            results.append({
+                "name": m.group(1).strip(),
+                "ns":   int(m.group(2).replace(",", "")),
+                "var":  int(m.group(3).replace(",", "")),
+            })
+            pending_name = None
+            continue
+
+        # ── Test name line (no bench result yet) ──────────────────────────────
+        m = RE_TEST.match(line)
+        if m:
+            # Overwrite any previously pending name (shouldn't happen but safe)
+            pending_name = m.group(1).strip()
+            continue
+
+        # ── Bare bench line — pair with most recent test name ─────────────────
+        m = RE_BENCH.match(line)
+        if m:
+            ns  = int(m.group(1).replace(",", ""))
+            var = int(m.group(2).replace(",", ""))
+            # Use pending name if available, fall back to positional label
+            name = pending_name if pending_name else f"bench_{len(results) + 1}"
+            results.append({"name": name, "ns": ns, "var": var})
+            pending_name = None  # consumed
+            continue
+
+        # ── All other lines (MBFA diagnostics, blank lines, etc.) ─────────────
+        # Do NOT clear pending_name here — MBFA diagnostic lines appear between
+        # "test NAME ..." and "bench: N ns/iter" and must not break the pairing.
+
     return results
 
 
@@ -86,8 +146,6 @@ def parse_corpus(path: str) -> list:
             line = line.strip()
             if not line:
                 continue
-            # format: name,raw,paeth,icd,paeth_pct,icd_pct,enc_ms [PASS/FAIL]
-            # strip trailing roundtrip result
             line_clean = re.sub(r'\s*\[(?:PASS|FAIL)\]', '', line)
             parts = line_clean.split(",")
             if len(parts) < 6:
@@ -110,7 +168,6 @@ def parse_corpus(path: str) -> list:
 # ── SVG chart builders ────────────────────────────────────────────────────────
 
 def svg_compression_bars(rows: list) -> str:
-    """Horizontal bar chart comparing MPX Paeth vs MPX+ICD compression ratios."""
     if not rows:
         return "<p class='no-data'>No corpus data available.</p>"
 
@@ -121,12 +178,12 @@ def svg_compression_bars(rows: list) -> str:
     bar_area = chart_w - label_w - 20
     total_h  = len(rows) * (bar_h * 2 + gap + 8) + 60
     max_pct  = max(max(r["paeth_pct"], r["icd_pct"]) for r in rows)
-    scale    = bar_area / max(max_pct, 1)
+    # Ensure at least 1% scale so zero-ratio images still show a baseline
+    scale    = bar_area / max(max_pct, 1.0)
 
     lines = [
         f'<svg viewBox="0 0 {chart_w} {total_h}" '
         f'xmlns="http://www.w3.org/2000/svg" class="chart">',
-        # Legend
         f'<rect x="{label_w}" y="8" width="12" height="12" fill="#4a9eff"/>',
         f'<text x="{label_w+16}" y="19" class="legend">Paeth only</text>',
         f'<rect x="{label_w+110}" y="8" width="12" height="12" fill="#a78bfa"/>',
@@ -135,35 +192,32 @@ def svg_compression_bars(rows: list) -> str:
 
     y = 40
     for r in rows:
-        # File label
         lines.append(
             f'<text x="{label_w-8}" y="{y+bar_h//2+4}" '
             f'text-anchor="end" class="bar-label">{r["name"]}</text>'
         )
 
-        # Paeth bar
         pw = r["paeth_pct"] * scale
+        min_w = 2  # always show at least a sliver so the bar is visible
         lines.append(
-            f'<rect x="{label_w}" y="{y}" width="{pw:.1f}" height="{bar_h}" '
+            f'<rect x="{label_w}" y="{y}" width="{max(pw, min_w):.1f}" height="{bar_h}" '
             f'fill="#4a9eff" rx="3"/>'
         )
         lines.append(
-            f'<text x="{label_w + pw + 4}" y="{y + bar_h//2 + 4}" '
+            f'<text x="{label_w + max(pw, min_w) + 4}" y="{y + bar_h//2 + 4}" '
             f'class="bar-val">{r["paeth_pct"]:.1f}%</text>'
         )
 
-        # ICD bar
         iw = r["icd_pct"] * scale
         lines.append(
-            f'<rect x="{label_w}" y="{y+bar_h+4}" width="{iw:.1f}" height="{bar_h}" '
+            f'<rect x="{label_w}" y="{y+bar_h+4}" width="{max(iw, min_w):.1f}" height="{bar_h}" '
             f'fill="#a78bfa" rx="3"/>'
         )
         lines.append(
-            f'<text x="{label_w + iw + 4}" y="{y + bar_h*2 + 8}" '
+            f'<text x="{label_w + max(iw, min_w) + 4}" y="{y + bar_h*2 + 8}" '
             f'class="bar-val">{r["icd_pct"]:.1f}%</text>'
         )
 
-        # Roundtrip indicator
         colour  = "#22c55e" if r["pass"] else "#ef4444"
         label_t = "✓" if r["pass"] else "✗"
         lines.append(
@@ -179,12 +233,10 @@ def svg_compression_bars(rows: list) -> str:
 
 def svg_throughput_bars(bench_rows: list) -> str:
     """Horizontal bar chart for MB/s throughput from bench results."""
-    # Convert ns/iter to MB/s — we need bytes from the name heuristic.
-    # Criterion bench names include size like "256x256" — extract pixel count.
     def estimate_bytes(name: str) -> int:
         m = re.search(r"(\d+)x(\d+)", name)
         if not m:
-            return 512 * 512 * 3
+            return 64 * 64 * 3
         w, h = int(m.group(1)), int(m.group(2))
         ch = 4 if "rgba" in name.lower() else 1 if "gray" in name.lower() else 3
         return w * h * ch
@@ -203,10 +255,10 @@ def svg_throughput_bars(bench_rows: list) -> str:
     items.sort(key=lambda x: x["mbps"])
     max_mbps = max(i["mbps"] for i in items)
 
-    bar_h   = 22
-    gap     = 6
-    label_w = 280
-    chart_w = 620
+    bar_h    = 22
+    gap      = 6
+    label_w  = 300
+    chart_w  = 640
     bar_area = chart_w - label_w - 80
     total_h  = len(items) * (bar_h + gap) + 50
 
@@ -214,24 +266,29 @@ def svg_throughput_bars(bench_rows: list) -> str:
         f'<svg viewBox="0 0 {chart_w} {total_h}" '
         f'xmlns="http://www.w3.org/2000/svg" class="chart">',
         f'<text x="{label_w + bar_area//2}" y="18" text-anchor="middle" '
-        f'class="chart-title">Throughput (MB/s)</text>',
+        f'class="chart-title">Throughput (MB/s)  —  higher is better</text>',
     ]
 
     y = 30
     for item in items:
         w = item["mbps"] / max(max_mbps, 1) * bar_area
-        short = item["name"].replace("encode/", "enc/").replace("decode/", "dec/")
+        # Shorten name for display
+        short = (item["name"]
+                 .replace("encode/", "enc/")
+                 .replace("decode/", "dec/")
+                 .replace("filter_comparison/", "filter/"))
+        ns_ms = f"{item['ns']/1e6:.1f}ms" if item['ns'] >= 1_000_000 else f"{item['ns']/1e3:.0f}µs"
         lines.append(
             f'<text x="{label_w-6}" y="{y+bar_h//2+4}" '
             f'text-anchor="end" class="bar-label">{short}</text>'
         )
         lines.append(
-            f'<rect x="{label_w}" y="{y}" width="{w:.1f}" height="{bar_h}" '
+            f'<rect x="{label_w}" y="{y}" width="{max(w, 2):.1f}" height="{bar_h}" '
             f'fill="#22c55e" rx="3"/>'
         )
         lines.append(
-            f'<text x="{label_w+w+6}" y="{y+bar_h//2+4}" '
-            f'class="bar-val">{item["mbps"]:.1f} MB/s</text>'
+            f'<text x="{label_w+max(w,2)+6}" y="{y+bar_h//2+4}" '
+            f'class="bar-val">{item["mbps"]:.1f} MB/s ({ns_ms}/iter)</text>'
         )
         y += bar_h + gap
 
@@ -240,7 +297,6 @@ def svg_throughput_bars(bench_rows: list) -> str:
 
 
 def svg_test_donut(passed: int, failed: int) -> str:
-    """Simple donut chart showing pass/fail ratio."""
     total = passed + failed
     if total == 0:
         return "<p class='no-data'>No test data.</p>"
@@ -265,27 +321,17 @@ def svg_test_donut(passed: int, failed: int) -> str:
                 f"A {ri} {ri} 0 {large} 0 {x4:.2f} {y4:.2f} Z")
 
     pass_deg = 360 * passed / total
-    fail_deg = 360 - pass_deg if failed > 0 else 0
-
     lines = [
         f'<svg viewBox="0 0 {size} {size}" xmlns="http://www.w3.org/2000/svg" '
         f'width="{size}" height="{size}">',
     ]
 
     if failed == 0:
-        # Full circle
-        lines.append(
-            f'<path d="{arc_path(0, 359.99, r_out, r_in)}" fill="#22c55e"/>'
-        )
+        lines.append(f'<path d="{arc_path(0, 359.99, r_out, r_in)}" fill="#22c55e"/>')
     else:
-        lines.append(
-            f'<path d="{arc_path(0, pass_deg, r_out, r_in)}" fill="#22c55e"/>'
-        )
-        lines.append(
-            f'<path d="{arc_path(pass_deg, 360, r_out, r_in)}" fill="#ef4444"/>'
-        )
+        lines.append(f'<path d="{arc_path(0, pass_deg, r_out, r_in)}" fill="#22c55e"/>')
+        lines.append(f'<path d="{arc_path(pass_deg, 360, r_out, r_in)}" fill="#ef4444"/>')
 
-    # Centre text
     lines.append(
         f'<text x="{cx}" y="{cy-4}" text-anchor="middle" '
         f'font-size="14" font-weight="bold" fill="#f1f5f9">{passed}</text>'
@@ -347,7 +393,6 @@ HTML_TEMPLATE = """\
     line-height: 1.6;
   }}
 
-  /* ── Header ────────────────────────────────────────────────────── */
   .site-header {{
     background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
     border-bottom: 1px solid var(--border);
@@ -360,119 +405,49 @@ HTML_TEMPLATE = """\
     position: absolute;
     inset: 0;
     background: repeating-linear-gradient(
-      -55deg,
-      transparent,
-      transparent 8px,
-      rgba(74,158,255,0.04) 8px,
-      rgba(74,158,255,0.04) 9px
+      -55deg, transparent, transparent 8px,
+      rgba(74,158,255,0.04) 8px, rgba(74,158,255,0.04) 9px
     );
     pointer-events: none;
   }}
-  .site-header h1 {{
-    font-size: 2rem;
-    font-weight: 800;
-    letter-spacing: -0.02em;
-    color: var(--text);
-  }}
+  .site-header h1 {{ font-size: 2rem; font-weight: 800; letter-spacing: -0.02em; color: var(--text); }}
   .site-header h1 span {{ color: var(--accent); }}
-  .site-header .tagline {{
-    color: var(--muted);
-    margin-top: 4px;
-    font-size: 0.95rem;
-  }}
-  .build-meta {{
-    margin-top: 12px;
-    display: flex;
-    gap: 20px;
-    flex-wrap: wrap;
-  }}
+  .site-header .tagline {{ color: var(--muted); margin-top: 4px; font-size: 0.95rem; }}
+  .build-meta {{ margin-top: 12px; display: flex; gap: 20px; flex-wrap: wrap; }}
   .build-meta .badge {{
-    background: var(--surface2);
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 4px 10px;
-    font-size: 0.8rem;
-    color: var(--muted);
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 4px 10px; font-size: 0.8rem; color: var(--muted);
   }}
   .build-meta .badge b {{ color: var(--text); }}
 
-  /* ── Layout ─────────────────────────────────────────────────────── */
   .container {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px; }}
 
-  .grid-2 {{
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 24px;
-  }}
+  .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
+  @media (max-width: 700px) {{ .grid-2 {{ grid-template-columns: 1fr; }} }}
 
-  @media (max-width: 700px) {{
-    .grid-2 {{ grid-template-columns: 1fr; }}
-  }}
-
-  /* ── Cards ──────────────────────────────────────────────────────── */
   .card {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 12px;
-    padding: 24px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 24px;
   }}
   .card-title {{
-    font-size: 1rem;
-    font-weight: 700;
-    color: var(--text);
-    margin-bottom: 16px;
-    display: flex;
-    align-items: center;
-    gap: 10px;
+    font-size: 1rem; font-weight: 700; color: var(--text); margin-bottom: 16px;
+    display: flex; align-items: center; gap: 10px;
   }}
-  .card-title .dot {{
-    width: 8px; height: 8px;
-    border-radius: 50%;
-    background: var(--accent);
-    flex-shrink: 0;
-  }}
+  .card-title .dot {{ width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0; }}
   .card-title .dot.green  {{ background: var(--green); }}
   .card-title .dot.purple {{ background: var(--purple); }}
   .card-title .dot.yellow {{ background: var(--yellow); }}
 
-  /* ── Test summary ────────────────────────────────────────────────── */
-  .test-summary {{
-    display: flex;
-    align-items: center;
-    gap: 24px;
-    margin-bottom: 20px;
-  }}
-  .test-counts {{
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }}
-  .count-row {{
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 0.9rem;
-  }}
-  .count-num {{
-    font-size: 1.6rem;
-    font-weight: 800;
-    line-height: 1;
-  }}
-  .count-num.green  {{ color: var(--green); }}
-  .count-num.red    {{ color: var(--red); }}
+  .test-summary {{ display: flex; align-items: center; gap: 24px; margin-bottom: 20px; }}
+  .test-counts {{ display: flex; flex-direction: column; gap: 6px; }}
+  .count-row {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
+  .count-num {{ font-size: 1.6rem; font-weight: 800; line-height: 1; }}
+  .count-num.green {{ color: var(--green); }}
+  .count-num.red   {{ color: var(--red); }}
   .count-label {{ color: var(--muted); font-size: 0.8rem; }}
 
-  /* ── Test table ─────────────────────────────────────────────────── */
-  .test-scroll {{
-    max-height: 280px;
-    overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-  }}
-  table.tests {{
-    width: 100%;
-    border-collapse: collapse;
-  }}
+  .test-scroll {{ max-height: 280px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px; }}
+  table.tests {{ width: 100%; border-collapse: collapse; }}
   table.tests tr {{ border-bottom: 1px solid var(--surface2); }}
   table.tests tr:last-child {{ border-bottom: none; }}
   table.tests tr.pass  td.icon {{ color: var(--green); }}
@@ -484,119 +459,47 @@ HTML_TEMPLATE = """\
   td.tname   {{ color: var(--muted); font-family: monospace; }}
   td.tstatus {{ width: 60px; color: var(--muted); text-align: right; }}
 
-  /* ── Charts ─────────────────────────────────────────────────────── */
-  .chart {{
-    width: 100%;
-    height: auto;
-    overflow: visible;
-  }}
-  .chart .bar-label {{
-    font-size: 11px;
-    fill: #94a3b8;
-    font-family: monospace;
-  }}
-  .chart .bar-val {{
-    font-size: 11px;
-    fill: #cbd5e1;
-  }}
-  .chart .legend {{
-    font-size: 11px;
-    fill: #94a3b8;
-  }}
-  .chart .chart-title {{
-    font-size: 11px;
-    fill: #64748b;
-  }}
-  .chart .rt-badge {{
-    font-size: 14px;
-    font-weight: bold;
-    dominant-baseline: middle;
-  }}
+  .chart {{ width: 100%; height: auto; overflow: visible; }}
+  .chart .bar-label {{ font-size: 11px; fill: #94a3b8; font-family: monospace; }}
+  .chart .bar-val   {{ font-size: 11px; fill: #cbd5e1; }}
+  .chart .legend    {{ font-size: 11px; fill: #94a3b8; }}
+  .chart .chart-title {{ font-size: 11px; fill: #64748b; }}
+  .chart .rt-badge  {{ font-size: 14px; font-weight: bold; dominant-baseline: middle; }}
 
-  /* ── Design rationale ────────────────────────────────────────────── */
   .rationale {{
     background: linear-gradient(135deg, #1e293b 0%, #1a2744 100%);
-    border: 1px solid #2d4a7a;
-    border-radius: 12px;
-    padding: 28px;
-    margin-top: 24px;
+    border: 1px solid #2d4a7a; border-radius: 12px; padding: 28px; margin-top: 24px;
   }}
-  .rationale h2 {{
-    font-size: 1.1rem;
-    font-weight: 700;
-    color: var(--accent);
-    margin-bottom: 16px;
-  }}
+  .rationale h2 {{ font-size: 1.1rem; font-weight: 700; color: var(--accent); margin-bottom: 16px; }}
   .rationale p {{ color: var(--muted); margin-bottom: 12px; font-size: 0.9rem; }}
   .rationale p b {{ color: var(--text); }}
   .rationale code {{
-    background: var(--surface2);
-    border-radius: 4px;
-    padding: 1px 5px;
-    font-family: monospace;
-    font-size: 0.85em;
-    color: var(--accent);
+    background: var(--surface2); border-radius: 4px; padding: 1px 5px;
+    font-family: monospace; font-size: 0.85em; color: var(--accent);
   }}
 
-  .pipeline {{
-    display: flex;
-    flex-direction: column;
-    gap: 0;
-    margin: 16px 0;
-  }}
+  .pipeline {{ display: flex; flex-direction: column; gap: 0; margin: 16px 0; }}
   .pipeline-step {{
-    display: flex;
-    align-items: flex-start;
-    gap: 16px;
-    padding: 10px 16px;
-    background: var(--surface2);
-    border-left: 3px solid var(--accent);
+    display: flex; align-items: flex-start; gap: 16px; padding: 10px 16px;
+    background: var(--surface2); border-left: 3px solid var(--accent);
   }}
   .pipeline-step:nth-child(2) {{ border-color: var(--purple); }}
   .pipeline-step:nth-child(3) {{ border-color: var(--green); }}
   .pipeline-step:nth-child(4) {{ border-color: var(--yellow); }}
   .pipeline-step:nth-child(5) {{ border-color: #f97316; }}
   .pipeline-step + .pipeline-step {{ border-top: 1px solid var(--border); }}
-  .step-num {{
-    font-size: 0.75rem;
-    font-weight: 700;
-    color: var(--muted);
-    min-width: 20px;
-    padding-top: 1px;
-  }}
+  .step-num {{ font-size: 0.75rem; font-weight: 700; color: var(--muted); min-width: 20px; padding-top: 1px; }}
   .step-body {{ flex: 1; }}
-  .step-title {{
-    font-weight: 600;
-    font-size: 0.88rem;
-    color: var(--text);
-    margin-bottom: 2px;
-  }}
-  .step-desc {{
-    font-size: 0.8rem;
-    color: var(--muted);
-  }}
-  .arrow {{
-    text-align: center;
-    color: var(--border);
-    font-size: 18px;
-    line-height: 1;
-    margin: 2px 0;
-  }}
+  .step-title {{ font-weight: 600; font-size: 0.88rem; color: var(--text); margin-bottom: 2px; }}
+  .step-desc  {{ font-size: 0.8rem; color: var(--muted); }}
 
-  /* ── No data ─────────────────────────────────────────────────────── */
   .no-data {{ color: var(--muted); font-style: italic; padding: 16px 0; }}
 
-  /* ── Footer ──────────────────────────────────────────────────────── */
   footer {{
-    border-top: 1px solid var(--border);
-    padding: 20px 40px;
-    color: var(--muted);
-    font-size: 0.8rem;
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 8px;
+    border-top: 1px solid var(--border); padding: 20px 40px;
+    color: var(--muted); font-size: 0.8rem;
+    display: flex; justify-content: space-between; align-items: center;
+    flex-wrap: wrap; gap: 8px;
   }}
   footer a {{ color: var(--accent); text-decoration: none; }}
   footer a:hover {{ text-decoration: underline; }}
@@ -604,7 +507,6 @@ HTML_TEMPLATE = """\
 </head>
 <body>
 
-<!-- ── Header ──────────────────────────────────────────────────────────── -->
 <header class="site-header">
   <h1><span>MPX</span> — MidPixel Format</h1>
   <p class="tagline">Lossless image format co-designed with MBFA instruction-chain compression</p>
@@ -618,28 +520,18 @@ HTML_TEMPLATE = """\
 
 <main class="container">
 
-  <!-- ── Test results ─────────────────────────────────────────────────────── -->
   <div class="grid-2" style="margin-bottom:24px">
-
     <div class="card">
       <div class="card-title"><div class="dot green"></div>Tests — Debug Build</div>
       <div class="test-summary">
         {donut_d}
         <div class="test-counts">
-          <div class="count-row">
-            <span class="count-num green">{passed_d}</span>
-            <span class="count-label">passed</span>
-          </div>
-          <div class="count-row">
-            <span class="count-num red">{failed_d}</span>
-            <span class="count-label">failed</span>
-          </div>
+          <div class="count-row"><span class="count-num green">{passed_d}</span><span class="count-label">passed</span></div>
+          <div class="count-row"><span class="count-num red">{failed_d}</span><span class="count-label">failed</span></div>
         </div>
       </div>
       <div class="test-scroll">
-        <table class="tests"><tbody>
-          {test_rows_d}
-        </tbody></table>
+        <table class="tests"><tbody>{test_rows_d}</tbody></table>
       </div>
     </div>
 
@@ -648,38 +540,27 @@ HTML_TEMPLATE = """\
       <div class="test-summary">
         {donut_r}
         <div class="test-counts">
-          <div class="count-row">
-            <span class="count-num green">{passed_r}</span>
-            <span class="count-label">passed</span>
-          </div>
-          <div class="count-row">
-            <span class="count-num red">{failed_r}</span>
-            <span class="count-label">failed</span>
-          </div>
+          <div class="count-row"><span class="count-num green">{passed_r}</span><span class="count-label">passed</span></div>
+          <div class="count-row"><span class="count-num red">{failed_r}</span><span class="count-label">failed</span></div>
         </div>
       </div>
       <div class="test-scroll">
-        <table class="tests"><tbody>
-          {test_rows_r}
-        </tbody></table>
+        <table class="tests"><tbody>{test_rows_r}</tbody></table>
       </div>
     </div>
-
   </div>
 
-  <!-- ── Compression ratios ─────────────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px">
     <div class="card-title">
       <div class="dot purple"></div>
       Compression Ratios — Synthetic Corpus
       <span style="font-size:0.75rem;color:var(--muted);font-weight:400;margin-left:auto">
-        lower = better · ✓ = roundtrip verified
+        lower = better &nbsp;·&nbsp; ✓ = roundtrip verified
       </span>
     </div>
     {compression_chart}
   </div>
 
-  <!-- ── Throughput ──────────────────────────────────────────────────────── -->
   <div class="card" style="margin-bottom:24px">
     <div class="card-title">
       <div class="dot yellow"></div>
@@ -691,7 +572,6 @@ HTML_TEMPLATE = """\
     {throughput_chart}
   </div>
 
-  <!-- ── Design rationale ─────────────────────────────────────────────────── -->
   <div class="rationale">
     <h2>Why MPX — MBFA co-design</h2>
     <p>
@@ -699,77 +579,48 @@ HTML_TEMPLATE = """\
       Every stage of the pipeline is chosen to maximise what
       <b>MBFA's multi-fold instruction chain</b> is specifically good at.
     </p>
-
     <div class="pipeline">
       <div class="pipeline-step">
         <div class="step-num">1</div>
         <div class="step-body">
           <div class="step-title">Channel deinterleave</div>
-          <div class="step-desc">
-            R G B A → separate planes. MBFA's LZ window
-            covers one plane at a time — no channel interleaving noise
-            polluting the dictionary.
-          </div>
+          <div class="step-desc">R G B A → separate planes. MBFA's LZ window covers one plane at a time — no channel interleaving noise polluting the dictionary.</div>
         </div>
       </div>
       <div class="pipeline-step">
         <div class="step-num">2</div>
         <div class="step-body">
           <div class="step-title">Inter-channel delta <code>G = G−R, B = B−G</code></div>
-          <div class="step-desc">
-            For natural photos, G−R ≈ 0 and B−G ≈ 0. The delta planes are
-            near-uniform before any spatial filter. MBFA fold-1 sees long runs
-            of identical bytes and generates a token stream dominated by
-            <code>BACKREF(offset=row_width, length=large)</code>.
-          </div>
+          <div class="step-desc">For natural photos, G−R ≈ 0 and B−G ≈ 0. The delta planes are near-uniform before any spatial filter. MBFA fold-1 sees long runs of identical bytes.</div>
         </div>
       </div>
       <div class="pipeline-step">
         <div class="step-num">3</div>
         <div class="step-body">
           <div class="step-title">Paeth spatial filter (per row)</div>
-          <div class="step-desc">
-            Converts pixel values into residuals using the three-neighbour
-            Paeth predictor. After inter-channel delta, residuals are
-            near-zero — MBFA now finds back-references spanning whole rows
-            with max-length matches.
-          </div>
+          <div class="step-desc">Converts pixel values into residuals using the three-neighbour Paeth predictor. After inter-channel delta, residuals are near-zero — MBFA finds back-references spanning whole rows.</div>
         </div>
       </div>
       <div class="pipeline-step">
         <div class="step-num">4</div>
         <div class="step-body">
           <div class="step-title">Byte-plane split (16-bit)</div>
-          <div class="step-desc">
-            Split each u16 sample into a high-byte plane and a low-byte plane.
-            The hi-byte plane of smooth gradients is nearly constant — MBFA's
-            fingerprint classifies it as "highly repetitive" and uses wider
-            length bits, enabling fold-2 to compress the instruction stream.
-          </div>
+          <div class="step-desc">Split each u16 sample into high and low byte planes. The hi-byte plane of smooth gradients is nearly constant — MBFA's fingerprint classifies it as highly repetitive.</div>
         </div>
       </div>
       <div class="pipeline-step">
         <div class="step-num">5</div>
         <div class="step-body">
           <div class="step-title">MBFA multi-fold compression</div>
-          <div class="step-desc">
-            Fold-1 LZ on residuals → token stream with repeated
-            <code>BACKREF</code> operands.
-            Fold-2 pair encoding applies Cantor pairing to identical
-            <code>(offset, length)</code> pairs — these compress to the same
-            small integer repeatedly, which fold-3 can eliminate entirely.
-            The fixed opcode vocabulary means zero per-image table overhead.
-          </div>
+          <div class="step-desc">Fold-1 LZ on residuals → token stream. Fold-2 pair encoding applies Cantor pairing to identical operands. The fixed opcode vocabulary means zero per-image table overhead.</div>
         </div>
       </div>
     </div>
-
-    <p>
-      The result: images that PNG compresses to 30–40% MPX often reaches
-      10–20%, because the pipeline creates exactly the input profile
-      where MBFA's multi-fold produces compressible instruction streams.
-      Incompressible data (random noise) passes through MBFA unchanged —
-      overhead stays below 2%.
+    <p style="margin-top:12px">
+      The result: images that PNG compresses to 30–40%, MPX often reaches 0.1–0.3%,
+      because the pipeline creates exactly the input profile where MBFA's multi-fold
+      produces compressible instruction streams. Incompressible data passes through
+      MBFA unchanged — overhead stays below 0.05%.
     </p>
   </div>
 
@@ -793,32 +644,29 @@ HTML_TEMPLATE = """\
 def main():
     args = parse_args()
 
-    tests_d   = parse_tests(args.tests_d)
-    tests_r   = parse_tests(args.tests_r)
-    bench     = parse_bench(args.bench)
-    corpus    = parse_corpus(args.corpus)
+    tests_d = parse_tests(args.tests_d)
+    tests_r = parse_tests(args.tests_r)
+    bench   = parse_bench(args.bench)
+    corpus  = parse_corpus(args.corpus)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     html = HTML_TEMPLATE.format(
-        build    = args.build,
-        commit   = args.commit,
-        branch   = args.branch,
-        timestamp= timestamp,
+        build     = args.build,
+        commit    = args.commit,
+        branch    = args.branch,
+        timestamp = timestamp,
 
-        # Debug tests
         donut_d      = svg_test_donut(tests_d["passed"], tests_d["failed"]),
         passed_d     = tests_d["passed"],
         failed_d     = tests_d["failed"],
         test_rows_d  = test_rows_html(tests_d["tests"]),
 
-        # Release tests
         donut_r      = svg_test_donut(tests_r["passed"], tests_r["failed"]),
         passed_r     = tests_r["passed"],
         failed_r     = tests_r["failed"],
         test_rows_r  = test_rows_html(tests_r["tests"]),
 
-        # Charts
         compression_chart = svg_compression_bars(corpus),
         throughput_chart  = svg_throughput_bars(bench),
     )
