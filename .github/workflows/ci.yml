@@ -40,7 +40,7 @@ jobs:
             ~/.cargo/git
             target
             ../mbfa/target
-          key: mpx-${{ hashFiles('Cargo.toml', '../mbfa/Cargo.toml') }}
+          key: mpx-${{ hashFiles('Cargo.toml') }}
           restore-keys: mpx-
 
       - name: Check format
