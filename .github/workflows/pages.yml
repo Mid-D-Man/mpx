@@ -239,12 +239,12 @@ jobs:
             # Convert JPEG → PNG (lossless from this point forward).
             # Both PNG and MPX now start from identical pixel data.
             python3 -c "
-from PIL import Image
-img = Image.open('${tmp_jpg}').convert('RGB')
-img.save('${orig}', 'PNG')
-import os
-print(f'  Converted: {os.path.getsize(\"${tmp_jpg}\")}B JPEG → {os.path.getsize(\"${orig}\")}B PNG')
-" || {
+          from PIL import Image
+          img = Image.open('${tmp_jpg}').convert('RGB')
+          img.save('${orig}', 'PNG')
+          import os
+          print(f'  Converted: {os.path.getsize(\"${tmp_jpg}\")}B JPEG → {os.path.getsize(\"${orig}\")}B PNG')
+          " || {
               echo "  WARN: JPEG→PNG conversion failed — skipping ${name}"
               continue
             }
