@@ -78,12 +78,33 @@ pub fn decode(data: &[u8]) -> io::Result<(MpxHeader, Vec<u8>)> {
         }
     }
 
-    // ── 4. Undo inter-channel delta ───────────────────────────────────────────
-    // Inverse: G = (G-R)+R, B = (B-G)+G. Must add in forward order.
+    // ── 4a. Undo YCoCg-R transform ────────────────────────────────────────────
+    // Inverse: t = Y-(Cg>>1), G = Cg+t, B = t-(Co>>1), R = B+Co
+    // planes[0]=Y, planes[1]=Co, planes[2]=Cg, planes[3]=A (unchanged)
+    if header.use_ycocg() && bps == 1 {
+        let n = plane_bytes;
+        let y_plane  = planes[0].clone();
+        let co_plane = planes[1].clone();
+        let cg_plane = planes[2].clone();
+        for i in 0..n {
+            let y  = y_plane[i]  as i16;
+            let co = co_plane[i] as i8 as i16;  // signed
+            let cg = cg_plane[i] as i8 as i16;  // signed
+            let t  = y  - (cg >> 1);
+            let g  = cg + t;
+            let b  = t  - (co >> 1);
+            let r  = b  + co;
+            planes[0][i] = r.clamp(0, 255) as u8;
+            planes[1][i] = g.clamp(0, 255) as u8;
+            planes[2][i] = b.clamp(0, 255) as u8;
+        }
+    }
+
+    // ── 4b. Undo simple inter-channel delta (GrayA) ───────────────────────────
     if header.inter_channel_delta() {
         for c in 1..channels.min(3) {
             let (left, right) = planes.split_at_mut(c);
-            let prev = left[c - 1].clone(); // reconstructed previous channel
+            let prev = left[c - 1].clone();
             let curr = &mut right[0];
             for i in 0..plane_bytes {
                 curr[i] = curr[i].wrapping_add(prev[i]);
