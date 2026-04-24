@@ -85,8 +85,8 @@ jobs:
       # --measurement-time 3 --sample-size 10  → each benchmark finishes
       # in ~3s regardless of iteration speed; total suite < 5 min.
       #
-      # 2>/dev/null  → drops MBFA's verbose diagnostic output (printed to
-      # stderr) so bench_raw.txt contains only Criterion's bencher lines.
+      # MBFA prints verbose diagnostics to stdout; parse_bench() handles
+      # the interleaved output transparently.
       - name: Build release binary
         run: cargo build --release
 
@@ -97,7 +97,7 @@ jobs:
             --output-format bencher \
             --measurement-time 3 \
             --sample-size 10 \
-            2>/dev/null | tee results/bench_raw.txt || true
+            | tee results/bench_raw.txt || true
           echo "Benchmark lines captured: $(grep -c 'bench:' results/bench_raw.txt || echo 0)"
 
       # ── Corpus ─────────────────────────────────────────────────────
@@ -180,17 +180,15 @@ jobs:
               FILE=$(basename "${raw%.raw}")
 
               T0=$(date +%s%N)
-              "$BIN" encode "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/p.mpx 2>/dev/null
+              # Suppress MBFA stdout + stderr so only the CSV line reaches the pipe
+              "$BIN" encode "$raw" "$W" "$H" "$COLOR" "$BPP" paeth /tmp/p.mpx >/dev/null 2>&1
               T1=$(date +%s%N)
               P_BYTES=$(wc -c < /tmp/p.mpx)
               P_MS=$(( (T1-T0)/1000000 ))
 
-              "$BIN" roundtrip "$raw" "$W" "$H" "$COLOR" "$BPP" 2>/dev/null \
+              "$BIN" roundtrip "$raw" "$W" "$H" "$COLOR" "$BPP" >/dev/null 2>&1 \
                 && RT="PASS" || RT="FAIL"
 
-              # encode-icd is not a separate subcommand — ICD is applied
-              # automatically for RGB/RGBA in the standard encode path.
-              # Both columns intentionally show the same value.
               ICD_BYTES=$P_BYTES
 
               P_PCT=$(awk "BEGIN{printf \"%.1f\",$P_BYTES/$RAW*100}")
@@ -201,6 +199,86 @@ jobs:
                 "$P_PCT" "$I_PCT" "$P_MS" "$RT"
             done
           } | tee results/corpus.csv
+
+      # ── Real-world image conversion & visual comparison ─────────────
+      # Download real photos, convert to MPX and back, embed in report.
+      # picsum.photos serves deterministic images for fixed seeds, so the
+      # report is reproducible across runs (same image for same seed).
+      # All binary calls suppress stdout/stderr so this step stays clean.
+      - name: Download and convert real images for visual comparison
+        run: |
+          mkdir -p results/images
+          BIN=./target/release/mpx
+
+          declare -a NAMES=("nature_photo" "urban_photo" "grayscale_photo")
+          declare -a URLS=(
+            "https://picsum.photos/seed/mpx_nature/400/300"
+            "https://picsum.photos/seed/mpx_urban/400/300"
+            "https://picsum.photos/seed/mpx_gray/400/300?grayscale"
+          )
+
+          for i in "${!NAMES[@]}"; do
+            name="${NAMES[$i]}"
+            url="${URLS[$i]}"
+            orig="results/images/${name}.jpg"
+            mpx_f="results/images/${name}.mpx"
+            dec_f="results/images/${name}_decoded.png"
+
+            echo "→ Downloading ${name}..."
+            curl -sL --max-time 30 --retry 2 "$url" -o "$orig" 2>/dev/null || {
+              echo "  WARN: download failed — skipping ${name}"
+              continue
+            }
+
+            echo "  Encoding to MPX..."
+            "$BIN" from-image "$orig" paeth "$mpx_f" >/dev/null 2>&1 || {
+              echo "  WARN: MPX encode failed — skipping ${name}"
+              continue
+            }
+
+            echo "  Decoding back to PNG..."
+            "$BIN" to-image "$mpx_f" "$dec_f" >/dev/null 2>&1 || true
+
+            orig_sz=$(wc -c < "$orig" 2>/dev/null || echo 0)
+            mpx_sz=$(wc -c < "$mpx_f"  2>/dev/null || echo 0)
+            echo "  ${orig_sz}B JPEG → ${mpx_sz}B MPX"
+          done
+
+          # Also run the ignored network roundtrip tests now that images
+          # have been downloaded and curl is confirmed available.
+          cargo test --release -- --ignored 2>&1 | tail -20 || true
+
+          # Build images.json for the HTML report generator
+          python3 - <<'PYEOF'
+          import base64, json, os, glob
+
+          results = []
+          for mpx_f in sorted(glob.glob('results/images/*.mpx')):
+              stem  = os.path.splitext(os.path.basename(mpx_f))[0]
+              orig  = f'results/images/{stem}.jpg'
+              dec_f = f'results/images/{stem}_decoded.png'
+              if not os.path.exists(orig) or not os.path.exists(dec_f):
+                  continue
+
+              with open(orig,  'rb') as f: orig_b64 = base64.b64encode(f.read()).decode()
+              with open(dec_f, 'rb') as f: dec_b64  = base64.b64encode(f.read()).decode()
+
+              results.append({
+                  'name':      stem.replace('_', ' ').title(),
+                  'orig_size': os.path.getsize(orig),
+                  'mpx_size':  os.path.getsize(mpx_f),
+                  'dec_size':  os.path.getsize(dec_f),
+                  'orig_ext':  'jpg',
+                  'orig_type': 'image/jpeg',
+                  'orig_b64':  orig_b64,
+                  'dec_b64':   dec_b64,
+              })
+
+          with open('results/images.json', 'w') as f:
+              json.dump(results, f)
+
+          print(f"images.json: {len(results)} image(s) embedded")
+          PYEOF
 
       # ── Report generation ──────────────────────────────────────────
       - name: Generate HTML report
@@ -213,6 +291,7 @@ jobs:
             --tests-r   results/test_release.txt \
             --bench     results/bench_raw.txt \
             --corpus    results/corpus.csv \
+            --images    results/images.json \
             --out       site/index.html
 
       # ── Pages deployment ───────────────────────────────────────────
