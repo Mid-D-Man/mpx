@@ -16,9 +16,9 @@
 //!   2. Decode time
 //!   3. Throughput (MB/s)
 
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use mpx::{decode_image, encode_image, ColorType, FilterType};
 use std::time::Duration;
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use mpx::{ColorType, FilterType, encode_image, decode_image};
 
 // ── Test image generators ─────────────────────────────────────────────────────
 
@@ -35,23 +35,31 @@ fn gradient_rgb(w: usize, h: usize) -> Vec<u8> {
 }
 
 fn solid_rgba(w: usize, h: usize) -> Vec<u8> {
-    vec![64u8, 128, 200, 255].into_iter().cycle().take(w * h * 4).collect()
+    vec![64u8, 128, 200, 255]
+        .into_iter()
+        .cycle()
+        .take(w * h * 4)
+        .collect()
 }
 
 fn lcg_noise_rgb(w: usize, h: usize) -> Vec<u8> {
     let mut s: u32 = 0xdeadbeef;
-    (0..w * h * 3).map(|_| {
-        s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-        (s >> 24) as u8
-    }).collect()
+    (0..w * h * 3)
+        .map(|_| {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            (s >> 24) as u8
+        })
+        .collect()
 }
 
 fn ramp_gray16(w: usize, h: usize) -> Vec<u8> {
     let total = (w * h) as u32;
-    (0..w * h).flat_map(|i| {
-        let v: u16 = ((i as u32 * 65535) / total.max(1)) as u16;
-        v.to_le_bytes()
-    }).collect()
+    (0..w * h)
+        .flat_map(|i| {
+            let v: u16 = ((i as u32 * 65535) / total.max(1)) as u16;
+            v.to_le_bytes()
+        })
+        .collect()
 }
 
 // ── Encode benchmarks ─────────────────────────────────────────────────────────
@@ -71,10 +79,14 @@ fn bench_encode_gradient(c: &mut Criterion) {
             |b, px| {
                 b.iter(|| {
                     encode_image(
-                        size as u32, size as u32,
-                        ColorType::Rgb, 8, FilterType::Paeth,
+                        size as u32,
+                        size as u32,
+                        ColorType::Rgb,
+                        8,
+                        FilterType::Paeth,
                         black_box(px),
-                    ).unwrap()
+                    )
+                    .unwrap()
                 })
             },
         );
@@ -96,10 +108,14 @@ fn bench_encode_solid(c: &mut Criterion) {
             |b, px| {
                 b.iter(|| {
                     encode_image(
-                        size as u32, size as u32,
-                        ColorType::Rgba, 8, FilterType::Paeth,
+                        size as u32,
+                        size as u32,
+                        ColorType::Rgba,
+                        8,
+                        FilterType::Paeth,
                         black_box(px),
-                    ).unwrap()
+                    )
+                    .unwrap()
                 })
             },
         );
@@ -113,16 +129,20 @@ fn bench_encode_noise(c: &mut Criterion) {
     group.sample_size(10);
 
     // Noise is incompressible — MBFA exits early, so larger sizes are OK here.
-    let size  = 128usize;
+    let size = 128usize;
     let pixels = lcg_noise_rgb(size, size);
     group.throughput(Throughput::Bytes(pixels.len() as u64));
     group.bench_function("128x128", |b| {
         b.iter(|| {
             encode_image(
-                size as u32, size as u32,
-                ColorType::Rgb, 8, FilterType::Paeth,
+                size as u32,
+                size as u32,
+                ColorType::Rgb,
+                8,
+                FilterType::Paeth,
                 black_box(&pixels),
-            ).unwrap()
+            )
+            .unwrap()
         })
     });
     group.finish();
@@ -142,10 +162,14 @@ fn bench_encode_16bit(c: &mut Criterion) {
             |b, px| {
                 b.iter(|| {
                     encode_image(
-                        size as u32, size as u32,
-                        ColorType::Gray, 16, FilterType::Paeth,
+                        size as u32,
+                        size as u32,
+                        ColorType::Gray,
+                        16,
+                        FilterType::Paeth,
                         black_box(px),
-                    ).unwrap()
+                    )
+                    .unwrap()
                 })
             },
         );
@@ -161,11 +185,16 @@ fn bench_decode_gradient(c: &mut Criterion) {
     group.sample_size(10);
 
     for &size in &[32usize, 64, 128] {
-        let pixels  = gradient_rgb(size, size);
+        let pixels = gradient_rgb(size, size);
         let encoded = encode_image(
-            size as u32, size as u32,
-            ColorType::Rgb, 8, FilterType::Paeth, &pixels,
-        ).unwrap();
+            size as u32,
+            size as u32,
+            ColorType::Rgb,
+            8,
+            FilterType::Paeth,
+            &pixels,
+        )
+        .unwrap();
         group.throughput(Throughput::Bytes(encoded.len() as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}x{}", size, size)),
@@ -181,12 +210,17 @@ fn bench_decode_solid(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(10);
 
-    let size    = 64usize;
-    let pixels  = solid_rgba(size, size);
+    let size = 64usize;
+    let pixels = solid_rgba(size, size);
     let encoded = encode_image(
-        size as u32, size as u32,
-        ColorType::Rgba, 8, FilterType::Paeth, &pixels,
-    ).unwrap();
+        size as u32,
+        size as u32,
+        ColorType::Rgba,
+        8,
+        FilterType::Paeth,
+        &pixels,
+    )
+    .unwrap();
     group.throughput(Throughput::Bytes(encoded.len() as u64));
     group.bench_function("64x64", |b| {
         b.iter(|| decode_image(black_box(&encoded)).unwrap())
@@ -206,15 +240,27 @@ fn bench_filters_encode(c: &mut Criterion) {
     group.throughput(Throughput::Bytes(pixels.len() as u64));
 
     for filter in [
-        FilterType::None, FilterType::Sub, FilterType::Up,
-        FilterType::Average, FilterType::Paeth, FilterType::Adaptive,
+        FilterType::None,
+        FilterType::Sub,
+        FilterType::Up,
+        FilterType::Average,
+        FilterType::Paeth,
+        FilterType::Adaptive,
     ] {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{:?}", filter)),
             &pixels,
             |b, px| {
                 b.iter(|| {
-                    encode_image(w as u32, h as u32, ColorType::Rgb, 8, filter, black_box(px)).unwrap()
+                    encode_image(
+                        w as u32,
+                        h as u32,
+                        ColorType::Rgb,
+                        8,
+                        filter,
+                        black_box(px),
+                    )
+                    .unwrap()
                 })
             },
         );
