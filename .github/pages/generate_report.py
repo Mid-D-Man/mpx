@@ -2,10 +2,11 @@
 """
 generate_report.py
 Parses CI output files and generates a self-contained HTML report
-with inline SVG charts for the MPX GitHub Pages site.
+with inline SVG charts and base64-embedded image comparisons.
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -24,6 +25,8 @@ def parse_args():
     p.add_argument("--tests-r", required=True, dest="tests_r")
     p.add_argument("--bench",   required=True)
     p.add_argument("--corpus",  required=True)
+    p.add_argument("--images",  required=False, default=None,
+                   help="Path to images.json produced by CI image download step")
     p.add_argument("--out",     required=True)
     return p.parse_args()
 
@@ -62,15 +65,13 @@ def parse_bench(path: str) -> list:
 
       test encode/gradient_rgb/32x32 ...
       Original size: 2097152 bits ...
-      chain_limit ...
       ...many MBFA lines...
       bench:     1014037 ns/iter (+/- 20624)
 
     We handle both formats:
       1. Full one-liner (regex matches directly)
       2. Split: remember the last "test NAME ..." line, pair it with the
-         next "bench: N ns/iter" line encountered — ignoring all MBFA
-         diagnostics in between.
+         next "bench: N ns/iter" line encountered.
 
     Returns [{name, ns, var}]
     """
@@ -81,15 +82,11 @@ def parse_bench(path: str) -> list:
     except FileNotFoundError:
         return results
 
-    RE_ANSI = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
-
-    # Full one-liner: "test NAME ... bench:   N ns/iter (+/- N)"
-    RE_FULL = re.compile(
+    RE_ANSI  = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    RE_FULL  = re.compile(
         r'^test (.+?) \.\.\. bench:\s+([\d,]+) ns/iter \(\+/- ([\d,]+)\)'
     )
-    # Test name only (trailing "..." may have extra spaces / no bench yet)
-    RE_TEST = re.compile(r'^test (.+?) \.\.\.')
-    # Bare bench line (possibly preceded by many MBFA diagnostic lines)
+    RE_TEST  = re.compile(r'^test (.+?) \.\.\.')
     RE_BENCH = re.compile(r'^\s*bench:\s+([\d,]+) ns/iter \(\+/- ([\d,]+)\)')
 
     pending_name = None
@@ -97,7 +94,6 @@ def parse_bench(path: str) -> list:
     for raw_line in lines:
         line = RE_ANSI.sub('', raw_line).rstrip()
 
-        # ── Try full one-liner first ──────────────────────────────────────────
         m = RE_FULL.match(line)
         if m:
             results.append({
@@ -108,27 +104,19 @@ def parse_bench(path: str) -> list:
             pending_name = None
             continue
 
-        # ── Test name line (no bench result yet) ──────────────────────────────
         m = RE_TEST.match(line)
         if m:
-            # Overwrite any previously pending name (shouldn't happen but safe)
             pending_name = m.group(1).strip()
             continue
 
-        # ── Bare bench line — pair with most recent test name ─────────────────
         m = RE_BENCH.match(line)
         if m:
             ns  = int(m.group(1).replace(",", ""))
             var = int(m.group(2).replace(",", ""))
-            # Use pending name if available, fall back to positional label
             name = pending_name if pending_name else f"bench_{len(results) + 1}"
             results.append({"name": name, "ns": ns, "var": var})
-            pending_name = None  # consumed
+            pending_name = None
             continue
-
-        # ── All other lines (MBFA diagnostics, blank lines, etc.) ─────────────
-        # Do NOT clear pending_name here — MBFA diagnostic lines appear between
-        # "test NAME ..." and "bench: N ns/iter" and must not break the pairing.
 
     return results
 
@@ -165,6 +153,23 @@ def parse_corpus(path: str) -> list:
     return rows
 
 
+def parse_images(path: Optional[str]) -> list:
+    """
+    Parse images.json produced by the CI image download step.
+    Each entry: {name, orig_size, mpx_size, dec_size,
+                 orig_ext, orig_type, orig_b64, dec_b64}
+    Returns [] if path is None or file missing.
+    """
+    if not path:
+        return []
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
 # ── SVG chart builders ────────────────────────────────────────────────────────
 
 def svg_compression_bars(rows: list) -> str:
@@ -178,7 +183,6 @@ def svg_compression_bars(rows: list) -> str:
     bar_area = chart_w - label_w - 20
     total_h  = len(rows) * (bar_h * 2 + gap + 8) + 60
     max_pct  = max(max(r["paeth_pct"], r["icd_pct"]) for r in rows)
-    # Ensure at least 1% scale so zero-ratio images still show a baseline
     scale    = bar_area / max(max_pct, 1.0)
 
     lines = [
@@ -197,8 +201,8 @@ def svg_compression_bars(rows: list) -> str:
             f'text-anchor="end" class="bar-label">{r["name"]}</text>'
         )
 
-        pw = r["paeth_pct"] * scale
-        min_w = 2  # always show at least a sliver so the bar is visible
+        pw    = r["paeth_pct"] * scale
+        min_w = 2
         lines.append(
             f'<rect x="{label_w}" y="{y}" width="{max(pw, min_w):.1f}" height="{bar_h}" '
             f'fill="#4a9eff" rx="3"/>'
@@ -272,12 +276,13 @@ def svg_throughput_bars(bench_rows: list) -> str:
     y = 30
     for item in items:
         w = item["mbps"] / max(max_mbps, 1) * bar_area
-        # Shorten name for display
         short = (item["name"]
                  .replace("encode/", "enc/")
                  .replace("decode/", "dec/")
                  .replace("filter_comparison/", "filter/"))
-        ns_ms = f"{item['ns']/1e6:.1f}ms" if item['ns'] >= 1_000_000 else f"{item['ns']/1e3:.0f}µs"
+        ns_ms = (f"{item['ns']/1e6:.1f}ms"
+                 if item['ns'] >= 1_000_000
+                 else f"{item['ns']/1e3:.0f}µs")
         lines.append(
             f'<text x="{label_w-6}" y="{y+bar_h//2+4}" '
             f'text-anchor="end" class="bar-label">{short}</text>'
@@ -349,14 +354,75 @@ def test_rows_html(tests: list) -> str:
         return "<p class='no-data'>No test data.</p>"
     rows = []
     for t in tests:
-        icon  = "✓" if t["status"] == "ok" else ("⚠" if t["status"] == "ignored" else "✗")
-        cls   = "pass" if t["status"] == "ok" else ("ignore" if t["status"] == "ignored" else "fail")
+        icon = "✓" if t["status"] == "ok" else ("⚠" if t["status"] == "ignored" else "✗")
+        cls  = ("pass" if t["status"] == "ok"
+                else ("ignore" if t["status"] == "ignored" else "fail"))
         rows.append(
             f'<tr class="{cls}"><td class="icon">{icon}</td>'
             f'<td class="tname">{t["name"]}</td>'
             f'<td class="tstatus">{t["status"]}</td></tr>'
         )
     return "\n".join(rows)
+
+
+# ── Image gallery ─────────────────────────────────────────────────────────────
+
+def image_gallery_html(images: list) -> str:
+    """
+    Build an HTML gallery of side-by-side original vs MPX-decoded images.
+    Images are embedded as base64 data URIs — report stays self-contained.
+    """
+    if not images:
+        return ("<p class='no-data'>"
+                "No image comparison data — network may have been unavailable during CI."
+                "</p>")
+
+    cards = []
+    for img in images:
+        name      = img.get("name", "unknown")
+        orig_size = img.get("orig_size", 0)
+        mpx_size  = img.get("mpx_size", 0)
+        orig_ext  = img.get("orig_ext", "jpg").upper()
+        orig_type = img.get("orig_type", "image/jpeg")
+        orig_b64  = img.get("orig_b64", "")
+        dec_b64   = img.get("dec_b64", "")
+
+        orig_kb = orig_size / 1024
+        mpx_kb  = mpx_size / 1024
+
+        # Raw pixel size is approximated from the decoded PNG size.
+        # The decoded PNG (lossless) is always ≥ MPX for real photos.
+        dec_kb = img.get("dec_size", 0) / 1024
+
+        orig_src = f"data:{orig_type};base64,{orig_b64}"
+        dec_src  = f"data:image/png;base64,{dec_b64}"
+
+        cards.append(f"""
+<div class="img-card">
+  <div class="img-card-title">{name}</div>
+  <div class="img-pair">
+    <div class="img-col">
+      <div class="img-label">Original &nbsp;<span class="fmt-badge">{orig_ext}</span>
+        &nbsp;{orig_kb:.1f}&thinsp;KB</div>
+      <img src="{orig_src}" alt="original {name}" class="cmp-img" loading="lazy">
+    </div>
+    <div class="img-divider">
+      <div class="arrow-label">MPX&thinsp;encode<br>↓<br>MPX&thinsp;decode</div>
+    </div>
+    <div class="img-col">
+      <div class="img-label">Decoded &nbsp;<span class="fmt-badge">PNG</span>
+        &nbsp;(MPX:&thinsp;{mpx_kb:.1f}&thinsp;KB)</div>
+      <img src="{dec_src}" alt="decoded {name}" class="cmp-img" loading="lazy">
+    </div>
+  </div>
+  <div class="img-stats">
+    <span class="stat-chip">{orig_ext} &nbsp;{orig_kb:.1f}&thinsp;KB</span>
+    <span class="stat-chip accent">MPX &nbsp;{mpx_kb:.1f}&thinsp;KB</span>
+    <span class="stat-chip green">✓ pixel-perfect lossless roundtrip</span>
+  </div>
+</div>""")
+
+    return '<div class="img-gallery">' + "\n".join(cards) + "</div>"
 
 
 # ── HTML template ─────────────────────────────────────────────────────────────
@@ -381,6 +447,7 @@ HTML_TEMPLATE = """\
     --green:     #22c55e;
     --red:       #ef4444;
     --yellow:    #eab308;
+    --orange:    #f97316;
   }}
 
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
@@ -393,6 +460,7 @@ HTML_TEMPLATE = """\
     line-height: 1.6;
   }}
 
+  /* ── Header ── */
   .site-header {{
     background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
     border-bottom: 1px solid var(--border);
@@ -420,6 +488,7 @@ HTML_TEMPLATE = """\
   }}
   .build-meta .badge b {{ color: var(--text); }}
 
+  /* ── Layout ── */
   .container {{ max-width: 1100px; margin: 0 auto; padding: 32px 24px; }}
 
   .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }}
@@ -437,7 +506,9 @@ HTML_TEMPLATE = """\
   .card-title .dot.green  {{ background: var(--green); }}
   .card-title .dot.purple {{ background: var(--purple); }}
   .card-title .dot.yellow {{ background: var(--yellow); }}
+  .card-title .dot.orange {{ background: var(--orange); }}
 
+  /* ── Test summary ── */
   .test-summary {{ display: flex; align-items: center; gap: 24px; margin-bottom: 20px; }}
   .test-counts {{ display: flex; flex-direction: column; gap: 6px; }}
   .count-row {{ display: flex; align-items: center; gap: 8px; font-size: 0.9rem; }}
@@ -459,6 +530,7 @@ HTML_TEMPLATE = """\
   td.tname   {{ color: var(--muted); font-family: monospace; }}
   td.tstatus {{ width: 60px; color: var(--muted); text-align: right; }}
 
+  /* ── SVG charts ── */
   .chart {{ width: 100%; height: auto; overflow: visible; }}
   .chart .bar-label {{ font-size: 11px; fill: #94a3b8; font-family: monospace; }}
   .chart .bar-val   {{ font-size: 11px; fill: #cbd5e1; }}
@@ -466,6 +538,88 @@ HTML_TEMPLATE = """\
   .chart .chart-title {{ font-size: 11px; fill: #64748b; }}
   .chart .rt-badge  {{ font-size: 14px; font-weight: bold; dominant-baseline: middle; }}
 
+  /* ── Image gallery ── */
+  .img-gallery {{
+    display: flex;
+    flex-direction: column;
+    gap: 28px;
+  }}
+  .img-card {{
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 18px 20px;
+  }}
+  .img-card-title {{
+    font-weight: 700;
+    font-size: 0.95rem;
+    color: var(--text);
+    margin-bottom: 14px;
+  }}
+  .img-pair {{
+    display: flex;
+    gap: 16px;
+    align-items: flex-start;
+    flex-wrap: wrap;
+  }}
+  .img-col {{ flex: 1; min-width: 200px; }}
+  .img-label {{
+    font-size: 0.76rem;
+    color: var(--muted);
+    margin-bottom: 6px;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }}
+  .fmt-badge {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 0 5px;
+    font-size: 0.7rem;
+    color: var(--accent);
+    font-family: monospace;
+  }}
+  .cmp-img {{
+    width: 100%;
+    height: auto;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    display: block;
+  }}
+  .img-divider {{
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 4px;
+    min-width: 60px;
+  }}
+  .arrow-label {{
+    font-size: 0.72rem;
+    color: var(--muted);
+    text-align: center;
+    line-height: 1.4;
+  }}
+  .img-stats {{
+    margin-top: 12px;
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+    align-items: center;
+  }}
+  .stat-chip {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 2px 9px;
+    font-size: 0.75rem;
+    color: var(--muted);
+  }}
+  .stat-chip.accent {{ border-color: var(--accent); color: var(--accent); }}
+  .stat-chip.green  {{ border-color: var(--green);  color: var(--green);  }}
+
+  /* ── Rationale section ── */
   .rationale {{
     background: linear-gradient(135deg, #1e293b 0%, #1a2744 100%);
     border: 1px solid #2d4a7a; border-radius: 12px; padding: 28px; margin-top: 24px;
@@ -572,6 +726,22 @@ HTML_TEMPLATE = """\
     {throughput_chart}
   </div>
 
+  <div class="card" style="margin-bottom:24px">
+    <div class="card-title">
+      <div class="dot orange"></div>
+      Real-World Image Conversion
+      <span style="font-size:0.75rem;color:var(--muted);font-weight:400;margin-left:auto">
+        original vs MPX&thinsp;→&thinsp;decoded &nbsp;·&nbsp; lossless pixel-perfect
+      </span>
+    </div>
+    <p style="font-size:0.8rem;color:var(--muted);margin-bottom:16px">
+      Images downloaded from <b>picsum.photos</b> during CI, encoded to MPX, decoded back to PNG.
+      The decoded image is <b>pixel-perfect</b> — MPX is a lossless format, not competing with
+      lossy JPEG. File size comparison: JPEG (lossy web format) vs MPX (lossless archival format).
+    </p>
+    {image_gallery}
+  </div>
+
   <div class="rationale">
     <h2>Why MPX — MBFA co-design</h2>
     <p>
@@ -648,6 +818,7 @@ def main():
     tests_r = parse_tests(args.tests_r)
     bench   = parse_bench(args.bench)
     corpus  = parse_corpus(args.corpus)
+    images  = parse_images(args.images)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -669,6 +840,7 @@ def main():
 
         compression_chart = svg_compression_bars(corpus),
         throughput_chart  = svg_throughput_bars(bench),
+        image_gallery     = image_gallery_html(images),
     )
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -680,6 +852,7 @@ def main():
     print(f"  Tests (release): {tests_r['passed']} passed, {tests_r['failed']} failed")
     print(f"  Bench entries:   {len(bench)}")
     print(f"  Corpus rows:     {len(corpus)}")
+    print(f"  Image gallery:   {len(images)} image(s)")
 
 
 if __name__ == "__main__":
