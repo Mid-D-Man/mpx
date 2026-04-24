@@ -2,8 +2,9 @@
 
 use std::io;
 use crate::header::{
-    MpxHeader, FilterType, FLAG_BYTE_PLANE_SPLIT,
-    FLAG_INTER_CHANNEL_DELTA, HEADER_SIZE,
+    MpxHeader, FilterType,
+    FLAG_BYTE_PLANE_SPLIT, FLAG_INTER_CHANNEL_DELTA, FLAG_YCOCG_R,
+    HEADER_SIZE,
 };
 use crate::filter::{apply_filter, select_best_filter};
 
@@ -36,20 +37,33 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
         }
     }
 
-    // ── 2. Inter-channel delta (MBFA co-design) ───────────────────────────────
-    // G = G-R, B = B-G (using ORIGINAL values, not already-modified planes).
-    //
-    // BUG FIX: The original code mutated planes[1] (G→G-R) before computing
-    // planes[2] = B - planes[1], which gave B - (G-R) instead of B - G.
-    // Only ramp_256_gray16 (1-channel Gray) was passing because ICD is skipped
-    // for single-channel images.
-    //
-    // Fix: snapshot all original channel planes before the delta loop so each
-    // subtraction always references the pre-delta value of the previous channel.
-    //
-    // Decoder reconstructs in forward order:
-    //   c=1: G = (G-R) + R = G_orig  ✓
-    //   c=2: B = (B-G) + G_orig = B  ✓  (planes[1] already restored to G_orig)
+    // ── 2a. YCoCg-R lossless color transform (RGB/RGBA 8-bit) ─────────────────
+    // Much better decorrelation than simple ICD for natural photos.
+    // Forward: Co = R-B, t = B+(Co>>1), Cg = G-t, Y = t+(Cg>>1)
+    // Planes become [Y, Co, Cg, A] — near-zero Co/Cg for natural images.
+    if header.use_ycocg() && bps == 1 {
+        let n = plane_bytes;
+        // planes[0]=R, planes[1]=G, planes[2]=B (planes[3]=A unchanged)
+        let r_plane = planes[0].clone();
+        let g_plane = planes[1].clone();
+        let b_plane = planes[2].clone();
+        for i in 0..n {
+            let r = r_plane[i] as i16;
+            let g = g_plane[i] as i16;
+            let b = b_plane[i] as i16;
+            let co = r - b;
+            let t  = b + (co >> 1);
+            let cg = g - t;
+            let y  = t + (cg >> 1);
+            // Y in [0,255], Co/Cg in [-128,127] — store as wrapping u8
+            planes[0][i] = y  as u8;          // Y
+            planes[1][i] = co as u8;          // Co (wrapping)
+            planes[2][i] = cg as u8;          // Cg (wrapping)
+            // planes[3] = A, unchanged
+        }
+    }
+
+    // ── 2b. Simple inter-channel delta (GrayA only) ───────────────────────────
     if header.inter_channel_delta() {
         let originals: Vec<Vec<u8>> = (0..channels.min(3))
             .map(|c| planes[c].clone())
@@ -139,4 +153,4 @@ pub fn encode(header: &MpxHeader, pixels: &[u8]) -> io::Result<Vec<u8>> {
     }
 
     Ok(out)
-                }
+}
