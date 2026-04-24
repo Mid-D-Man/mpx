@@ -7,7 +7,7 @@ pub mod decode;
 
 pub use header::{
     MpxHeader, ColorType, FilterType,
-    HEADER_SIZE, FLAG_BYTE_PLANE_SPLIT, FLAG_INTER_CHANNEL_DELTA,
+    HEADER_SIZE, FLAG_BYTE_PLANE_SPLIT, FLAG_INTER_CHANNEL_DELTA, FLAG_YCOCG_R,
 };
 pub use encode::encode;
 pub use decode::decode;
@@ -16,8 +16,9 @@ use std::io;
 
 /// Encode raw interleaved pixels to MPX.
 ///
-/// Inter-channel delta (G = G−R, B = B−G) is automatically enabled for
-/// RGB and RGBA images. Single-channel images (Gray, GrayA) do not use it.
+/// RGB and RGBA images use YCoCg-R for better decorrelation on natural photos.
+/// GrayA uses simple inter-channel delta.
+/// Single-channel Gray uses neither.
 pub fn encode_image(
     width:      u32,
     height:     u32,
@@ -27,14 +28,33 @@ pub fn encode_image(
     pixels:     &[u8],
 ) -> io::Result<Vec<u8>> {
     let mut flags = 0u8;
+
     if bit_depth == 16 {
         flags |= FLAG_BYTE_PLANE_SPLIT;
     }
-    if color_type.channel_count() >= 3 {
-        flags |= FLAG_INTER_CHANNEL_DELTA;
+
+    match color_type {
+        ColorType::Rgb | ColorType::Rgba if bit_depth == 8 => {
+            // YCoCg-R: better than simple ICD for natural photos.
+            // For 16-bit we fall through to no color transform (rare case,
+            // typically medical/scientific where channel independence matters).
+            flags |= FLAG_YCOCG_R;
+        }
+        ColorType::GrayA => {
+            // Simple delta between Gray and Alpha plane.
+            flags |= FLAG_INTER_CHANNEL_DELTA;
+        }
+        _ => {}
     }
 
-    let header = MpxHeader { color_type, bit_depth, filter_type: filter, width, height, flags };
+    let header = MpxHeader {
+        color_type,
+        bit_depth,
+        filter_type: filter,
+        width,
+        height,
+        flags,
+    };
     encode(&header, pixels)
 }
 
