@@ -5,15 +5,18 @@ pub const VERSION:     u8      = 1;
 pub const HEADER_SIZE: usize   = 32;
 
 /// bit 0: split 16-bit samples into hi/lo byte planes before MBFA.
-/// Near-constant hi-byte planes give MBFA very long LZ back-references.
-pub const FLAG_BYTE_PLANE_SPLIT:      u8 = 0b0000_0001;
+pub const FLAG_BYTE_PLANE_SPLIT:    u8 = 0b0000_0001;
 
 /// bit 1: inter-channel delta — G=(G-R), B=(B-G), applied BEFORE spatial filter.
-/// For natural photos, these deltas cluster near zero, producing near-uniform
-/// residual planes. MBFA's fold-1 then generates a token stream dominated by
-/// BACKREF(offset=row_width, length=large), which fold-2 pair encoding
-/// compresses further via Cantor pairing of identical operands.
-pub const FLAG_INTER_CHANNEL_DELTA:   u8 = 0b0000_0010;
+/// Kept for single-channel GrayA images; RGB/RGBA prefers YCoCg-R (bit 2).
+pub const FLAG_INTER_CHANNEL_DELTA: u8 = 0b0000_0010;
+
+/// bit 2: YCoCg-R lossless color transform (RGB/RGBA only).
+/// Better decorrelation than simple ICD for natural photos.
+///   Forward:  Co = R-B,  t = B + (Co>>1),  Cg = G-t,  Y = t + (Cg>>1)
+///   Inverse:  t = Y-(Cg>>1), G = Cg+t, B = t-(Co>>1), R = B+Co
+/// Planes stored in order: Y, Co, Cg [, A].
+pub const FLAG_YCOCG_R:             u8 = 0b0000_0100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColorType {
@@ -95,8 +98,14 @@ impl MpxHeader {
         self.bit_depth == 16 && (self.flags & FLAG_BYTE_PLANE_SPLIT) != 0
     }
 
+    /// True when using simple G-R / B-G inter-channel delta (GrayA only now).
     pub fn inter_channel_delta(&self) -> bool {
-        self.channel_count() > 1 && (self.flags & FLAG_INTER_CHANNEL_DELTA) != 0
+        (self.flags & FLAG_INTER_CHANNEL_DELTA) != 0
+    }
+
+    /// True when using YCoCg-R lossless color transform (RGB/RGBA).
+    pub fn use_ycocg(&self) -> bool {
+        (self.flags & FLAG_YCOCG_R) != 0
     }
 
     pub fn serialize(&self) -> [u8; HEADER_SIZE] {
@@ -117,8 +126,8 @@ impl MpxHeader {
         if data.len() < HEADER_SIZE {
             return Err(e("MPX header too short"));
         }
-        if data[0..4] != MAGIC       { return Err(e("not an MPX file")); }
-        if data[4]    != VERSION     { return Err(e(format!("unsupported version {}", data[4]))); }
+        if data[0..4] != MAGIC   { return Err(e("not an MPX file")); }
+        if data[4] != VERSION    { return Err(e(format!("unsupported version {}", data[4]))); }
 
         let color_type = ColorType::from_u8(data[5])
             .ok_or_else(|| e(format!("unknown color_type {}", data[5])))?;
