@@ -1,21 +1,22 @@
 [package]
-name = "msx"
+name = "mpx"
 version = "0.1.0"
 edition = "2021"
 authors = ["MidManStudio"]
-description = "MSX — MidStroke eXchange vector format built on DixScript and MBFA"
+description = "MPX — MidPixel lossless image format built on MBFA instruction-chain compression"
 license = "MIT"
 
 [[bin]]
-name = "msx"
+name = "mpx"
 path = "src/main.rs"
 
 [lib]
-name = "msx"
+name = "mpx"
 path = "src/lib.rs"
 
 [dependencies]
-mbfa = { path = "../mbfa" }
+mbfa  = { path = "../mbfa" }
+image = "0.25"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
