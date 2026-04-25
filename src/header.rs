@@ -7,15 +7,21 @@ pub const HEADER_SIZE: usize   = 32;
 /// bit 0: split 16-bit samples into hi/lo byte planes before MBFA.
 pub const FLAG_BYTE_PLANE_SPLIT:    u8 = 0b0000_0001;
 
-/// bit 1: inter-channel delta — G=(G-R), B=(B-G), applied BEFORE spatial filter.
-/// Kept for single-channel GrayA images; RGB/RGBA prefers YCoCg-R (bit 2).
+/// bit 1: simple inter-channel delta G=(G-R), B=(B-G).
+/// Used as fallback for incompressible RGB/RGBA and for GrayA.
 pub const FLAG_INTER_CHANNEL_DELTA: u8 = 0b0000_0010;
 
-/// bit 2: YCoCg-R lossless color transform (RGB/RGBA only).
-/// Better decorrelation than simple ICD for natural photos.
-///   Forward:  Co = R-B,  t = B + (Co>>1),  Cg = G-t,  Y = t + (Cg>>1)
-///   Inverse:  t = Y-(Cg>>1), G = Cg+t, B = t-(Co>>1), R = B+Co
-/// Planes stored in order: Y, Co, Cg [, A].
+/// bit 2: YCoCg-R lossless color transform (8-bit RGB/RGBA only).
+///
+/// Forward:  Co = R-B,  t = B+(Co>>1),  Cg = G-t,  Y = t+(Cg>>1)
+/// Inverse:  t = Y-(Cg>>1),  G = Cg+t,  B = t-(Co>>1),  R = B+Co
+///
+/// Y stays in [0,255] (u8). Co and Cg are in [-255,255] — stored as i16
+/// little-endian, giving each chrominance channel 2 bytes per sample.
+/// The byte-plane split is always applied to Co/Cg planes: the hi-byte
+/// plane (0x00 or 0xFF for typical photos) compresses to near-zero.
+///
+/// Planes order: [Y(u8), Co(i16 LE), Cg(i16 LE), A(u8) if RGBA].
 pub const FLAG_YCOCG_R:             u8 = 0b0000_0100;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,22 +97,66 @@ pub struct MpxHeader {
 impl MpxHeader {
     pub fn channel_count(&self)    -> usize { self.color_type.channel_count() }
     pub fn bytes_per_sample(&self) -> usize { (self.bit_depth / 8) as usize }
-    pub fn plane_row_bytes(&self)  -> usize { self.width as usize * self.bytes_per_sample() }
-    pub fn plane_bytes(&self)      -> usize { self.height as usize * self.plane_row_bytes() }
+
+    /// Legacy: row bytes assuming uniform channel width.
+    /// Use channel_plane_row_bytes(ch) when channels may differ (YCoCg-R).
+    pub fn plane_row_bytes(&self) -> usize {
+        self.width as usize * self.bytes_per_sample()
+    }
+
+    /// Legacy: total plane bytes assuming uniform channel width.
+    pub fn plane_bytes(&self) -> usize {
+        self.height as usize * self.plane_row_bytes()
+    }
+
+    // ── Per-channel sizing ────────────────────────────────────────────────────
+    // With YCoCg-R, channels 1 (Co) and 2 (Cg) are stored as i16 (2 bytes/sample).
+    // All other channels use the standard bytes_per_sample() width.
+
+    /// Bytes per sample for channel `ch`.
+    pub fn channel_bps(&self, ch: usize) -> usize {
+        if self.use_ycocg() && (ch == 1 || ch == 2) {
+            2 // Co and Cg stored as i16 LE
+        } else {
+            self.bytes_per_sample()
+        }
+    }
+
+    /// Uncompressed row size in bytes for channel `ch`.
+    pub fn channel_plane_row_bytes(&self, ch: usize) -> usize {
+        self.width as usize * self.channel_bps(ch)
+    }
+
+    /// Total uncompressed plane size in bytes for channel `ch`.
+    pub fn channel_plane_bytes(&self, ch: usize) -> usize {
+        self.height as usize * self.channel_plane_row_bytes(ch)
+    }
+
+    /// Whether channel `ch` should have its 16-bit samples byte-plane split.
+    /// Always true for Co/Cg (YCoCg-R), and for all channels of 16-bit images.
+    pub fn channel_needs_byte_split(&self, ch: usize) -> bool {
+        if self.use_ycocg() && (ch == 1 || ch == 2) {
+            true
+        } else {
+            self.byte_plane_split()
+        }
+    }
+
+    // ── Flag accessors ────────────────────────────────────────────────────────
 
     pub fn byte_plane_split(&self) -> bool {
         self.bit_depth == 16 && (self.flags & FLAG_BYTE_PLANE_SPLIT) != 0
     }
 
-    /// True when using simple G-R / B-G inter-channel delta (GrayA only now).
     pub fn inter_channel_delta(&self) -> bool {
         (self.flags & FLAG_INTER_CHANNEL_DELTA) != 0
     }
 
-    /// True when using YCoCg-R lossless color transform (RGB/RGBA).
     pub fn use_ycocg(&self) -> bool {
         (self.flags & FLAG_YCOCG_R) != 0
     }
+
+    // ── Serialization ─────────────────────────────────────────────────────────
 
     pub fn serialize(&self) -> [u8; HEADER_SIZE] {
         let mut buf = [0u8; HEADER_SIZE];
@@ -157,4 +207,4 @@ impl MpxHeader {
 #[inline]
 fn e(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
-}
+    }
